@@ -127,7 +127,19 @@ export function listCourses(rootAbs) {
   return out.sort((a, b) => a.code.localeCompare(b.code))
 }
 
-export function resolveWorkspace() {
+/**
+ * 解析课程工作区。
+ *
+ * @param {{defaultWorkspace?: string}} [opts]
+ *        defaultWorkspace：最后一道兜底的目录。**只给测试用**。
+ *        为什么要留这个口子：兜底值是 `DEFAULT_WORKSPACE`（教师机绝对路径），
+ *        在教师本机上恰好存在，于是「所有候选都落空」那条分支**永远走不到** ——
+ *        想验它就必须能在不改真实目录的前提下把兜底换掉。
+ *        踩过的坑：试过用 Rename-Item 把真实工作区临时改名来制造落空，
+ *        被系统拒绝（目录被运行中的 DSH 占着）—— 所以改成注入，不再动真实目录。
+ */
+export function resolveWorkspace(opts = {}) {
+  const defaultWorkspace = opts.defaultWorkspace || DEFAULT_WORKSPACE
   const tried = []
   /** 候选：[说明, 目录, 课程码]；课程码为空表示「这个目录本身就是课程」 */
   const candidates = []
@@ -142,7 +154,7 @@ export function resolveWorkspace() {
   const wf = process.env.CIP_WORKSPACE_FILE || path.join(os.homedir(), '.dsh', 'cip-workspace.txt')
   const fromFile = readWorkspaceFile(wf)
   if (fromFile) roots.push(['配置文件 ' + wf, fromFile])
-  roots.push(['内置默认值（教师机）', DEFAULT_WORKSPACE])
+  roots.push(['内置默认值（教师机）', defaultWorkspace])
 
   const codes = []
   if (process.env.CIP_COURSE_CODE) codes.push(process.env.CIP_COURSE_CODE)
@@ -174,12 +186,34 @@ export function resolveWorkspace() {
     const shared = target !== abs
     const label = how + ' → ' + target + (shared ? '（共享内容在上层）' : '')
     tried.push(label + ' ✓')
-    return { dir: target, courseDir: abs, courseCode: code, how: label, tried, shared }
+    return { dir: target, courseDir: abs, courseCode: code, how: label, tried, shared, resolved: true }
   }
-  const first = candidates[0]
+
+  // ── 一个候选都没通过校验：**必须说人话，不能静默给一个不存在的目录** ──────────
+  //
+  // 为什么会走到这里：解析链的最后一环是 `DEFAULT_WORKSPACE`，而那是**教师机的
+  // 绝对路径**（见文件顶部常量）。在教师本机上它恰好存在，于是永远命中、永远
+  // 不报错 —— 换一台机器（新电脑、学生机、CI）就必然落空。
+  //
+  // 踩过的坑：原来的实现是
+  //     return { dir: path.resolve(first[1]), how: first[0] + '（未验证）' }
+  // 即「把第一个候选**原样**当成答案，只在文案里加个括号」。后果是插件带着一个
+  // 不存在的目录继续往下跑：面板空着、没有任何一处报错，老师只能靠猜。
+  //
+  // 现在：dir 仍然给一个**能安全拼接的字符串**（保持向后兼容，避免下游 path.join 崩），
+  // 但把「没解析成功」变成**机器可判的字段** resolved:false，并由 warn() 打出一条
+  // 带修复办法的明确提示。
+  const fallback = roots[roots.length - 1][1]
   return {
-    dir: path.resolve(first[1]), courseDir: path.resolve(first[1]), courseCode: first[2],
-    how: first[0] + '（未验证）', tried, shared: false,
+    dir: path.resolve(fallback),
+    courseDir: path.resolve(fallback),
+    courseCode: '',
+    how: '未找到课程工作区（所有候选都没通过校验）',
+    tried,
+    shared: false,
+    resolved: false,
+    // 失败时提示里要给出**可照抄**的修复办法，所以把兜底值也带上
+    defaultWorkspace,
   }
 }
 
@@ -647,6 +681,41 @@ export async function listModelCatalog(ctx) {
     if (!has) out.models.unshift({ provider: out.current.provider, model: out.current.model, name: out.current.model + '（会话默认）', description: '', image: null, offCatalog: true })
   }
   return out
+}
+
+/**
+ * 没解析到课程工作区时，打出一组**能照做**的提示。
+ *
+ * 为什么值得单独成函数：
+ *   1. 这是新机器上最先撞到的坑，而且原来完全静默 —— 解析链的兜底是
+ *      `DEFAULT_WORKSPACE`（**教师机的绝对路径**），在教师本机上恰好存在，
+ *      所以这条分支永远走不到，也就永远没人发现提示有问题。
+ *   2. 分支走不到 = 没法用 createCore 端到端触发（本机默认路径确实存在）。
+ *      抽成纯函数之后可以直接喂一个 resolved:false 的 WS 来验，
+ *      不需要为了造场景去动真实目录（试过 Rename，被运行中的 DSH 占着，拒了）。
+ *
+ * @param {{resolved?:boolean,tried?:string[],how?:string}} WS resolveWorkspace() 的结果
+ * @param {string} workspace 解析出来的目录（可能并不存在）
+ * @param {string} label 插件显示名，用于前缀
+ * @param {{warning?:(...a:any[])=>void}} [logger] 默认 console
+ * @returns {boolean} 是否真的打了提示
+ */
+export function reportUnresolvedWorkspace(WS, workspace, label, logger = console) {
+  if (WS && WS.resolved !== false) return false
+  const warn = logger.warning || logger.warn
+  if (typeof warn !== 'function') return false
+  const p = (s) => warn.call(logger, '[' + label + '] ' + s)
+  p('⚠ 没找到课程工作区：' + workspace)
+  p('   最常见的原因是：这是另一台机器（新电脑/学生机/CI），而解析链的兜底是一个'
+    + '"教师机绝对路径"，只在教师本机上成立。')
+  p('   修法（任选一条，改完重启 DSH）：')
+  p('     ① 设环境变量 CIP_WORKSPACE=<你的课程工作区目录>')
+  p('     ② 或把这一行目录写进 ' + path.join(os.homedir(), '.dsh', 'cip-workspace.txt'))
+  p('        （在课程仓根目录跑 templates/install.ps1 会自动写）')
+  p('     ③ 共享式布局再加 CIP_COURSE_CODE=<课程码>，定位到 <根>' + path.sep + '课程' + path.sep + '<课程码>')
+  p('   判据：该目录下要有「课程中心' + path.sep + '课程结构索引.json」。')
+  p('   尝试过的候选：' + (WS && WS.tried && WS.tried.length ? WS.tried.join(' | ') : '（一个都没通过校验）'))
+  return true
 }
 
 export function msg(role, text, provider, model) {
@@ -1572,6 +1641,11 @@ export function createCore(ctx, opts) {
     // 诊断
     info: () => ({
       workspace: WORKSPACE, workspaceHow: WS.how, workspaceTried: WS.tried,
+      // 两个字段判的不是一回事，都要留着：
+      //   workspaceResolved     = 解析链**有没有一个候选通过校验**（配置层面）
+      //   workspaceLooksValid   = 解析出来的目录**里有没有「课程中心」**（数据层面）
+      // 例：CIP_WORKSPACE 指对了目录但里面还没建 课程中心/ → resolved=true, looksValid=false。
+      workspaceResolved: WS.resolved !== false,
       workspaceLooksValid: fs.existsSync(path.join(WORKSPACE, '课程中心')),
       role, label, prefix,
       mediaOk: cache.mediaOk === true, mediaError: cache.mediaError,
@@ -1614,6 +1688,9 @@ export function createCore(ctx, opts) {
       routes: routes.map((r) => r.path),
     }),
     warn() {
+      // 没解析到工作区时先说这一条（渲染与文案都在 reportUnresolvedWorkspace 里，
+      // 那个函数有独立用例覆盖，见 tools/verify-workspace-warning.mjs）。
+      if (reportUnresolvedWorkspace(WS, WORKSPACE, label)) return
       if (!fs.existsSync(path.join(WORKSPACE, '课程中心'))) {
         console.warn('[' + label + '] ⚠ 工作区里没有「课程中心」目录，面板会是空的。试过：')
         for (const t of WS.tried) console.warn('[' + label + ']   ' + t)
