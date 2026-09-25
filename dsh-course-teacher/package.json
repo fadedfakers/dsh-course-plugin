@@ -1,0 +1,39 @@
+{
+    "name":  "dsh-course-teacher",
+    "version":  "0.1.0",
+    "description":  "教师端课程面板：全量提问审计、共性问题汇总、归档与发布；不调用模型",
+    "type":  "module",
+    "main":  "./src/host.js",
+    "exports":  {
+                    ".":  {
+                              "default":  "./src/host.js"
+                          },
+                    "./client":  {
+                                     "default":  "./lib/client.js"
+                                 },
+                    "./package.json":  "./package.json"
+                },
+    "dsh":  {
+                "bundle":  {
+                               "patch":  "./cordis.patch.yml"
+                           },
+                "client":  {
+                               "inject":  [
+                                              "@deepseek-ai/dsh-client-modules",
+                                              "@deepseek-ai/dsh-client-ui-slots"
+                                          ],
+                               "platform":  "web"
+                           }
+            },
+    "files":  [
+                  "src",
+                  "lib",
+                  "cordis.patch.yml",
+                  "README.md"
+              ],
+    "engines":  {
+                    "node":  "\u003e=20"
+                },
+    "license":  "MIT",
+    "private":  true
+}

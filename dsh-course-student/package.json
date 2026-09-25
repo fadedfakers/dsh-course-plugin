@@ -1,0 +1,39 @@
+{
+    "name":  "dsh-course-student",
+    "version":  "0.1.0",
+    "description":  "学生端课程面板：提问与多轮追问、按教案批改、个人额度；与教师端为两个可同时安装的独立插件",
+    "type":  "module",
+    "main":  "./src/host.js",
+    "exports":  {
+                    ".":  {
+                              "default":  "./src/host.js"
+                          },
+                    "./client":  {
+                                     "default":  "./lib/client.js"
+                                 },
+                    "./package.json":  "./package.json"
+                },
+    "dsh":  {
+                "bundle":  {
+                               "patch":  "./cordis.patch.yml"
+                           },
+                "client":  {
+                               "inject":  [
+                                              "@deepseek-ai/dsh-client-modules",
+                                              "@deepseek-ai/dsh-client-ui-slots"
+                                          ],
+                               "platform":  "web"
+                           }
+            },
+    "files":  [
+                  "src",
+                  "lib",
+                  "cordis.patch.yml",
+                  "README.md"
+              ],
+    "engines":  {
+                    "node":  "\u003e=20"
+                },
+    "license":  "MIT",
+    "private":  true
+}

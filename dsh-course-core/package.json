@@ -1,0 +1,29 @@
+{
+  "name": "dsh-course-core",
+  "version": "0.1.0",
+  "description": "学生端与教师端课程插件共享的宿主内核：工作区解析 / 课程数据 / 问题条目存储 / 模型往返 / 路由装配",
+  "type": "module",
+  "main": "./src/bundle.js",
+  "exports": {
+    ".": { "default": "./src/bundle.js" },
+    "./client": { "default": "./lib/client-shared.js" },
+    "./host": { "default": "./src/host.js" },
+    "./prompt": { "default": "./src/prompt.js" },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-modules"
+      ],
+      "platform": "web"
+    }
+  },
+  "files": ["src", "lib", "cordis.patch.yml"],
+  "engines": { "node": ">=20" },
+  "license": "MIT",
+  "private": true
+}

@@ -1,0 +1,33 @@
+{
+  "_说明": "发布白名单。public/ 里出现的每一个文件都必须来自这里。默认全部 false —— 想发布谁就把谁的 publish 改成 true。",
+  "_危险操作提醒": "把 publish 改成 true 之前，先跑 `node course-repo.mjs check` 看清会发出哪些文件。",
+
+  "modules": {
+    "模块一": { "publish": false, "publishCode": false, "_note": "课时3-6 有教案（4/6）；另有『关于连续的补充材料』『绝妙的提示词』两份非课时文档，不在此机制内" },
+    "模块二": { "publish": true,  "publishCode": false, "_note": "课时7-12 教案齐全（6/6），教案含验收标准，适合作为首个发布样本" },
+    "模块三": { "publish": false, "publishCode": false, "_note": "课时13-18 教案齐全（6/6）" },
+    "模块四": { "publish": false, "publishCode": false, "_note": "教案 0/6，只有 README，无内容可发" },
+    "模块五": { "publish": false, "publishCode": false, "_note": "教案 0/6，只有 README，无内容可发" }
+  },
+
+  "lessons": null,
+  "_lessons说明": "想只发某几课时，把对应模块的 lessons 写成像 [7, 8, 9] 的数组；null 表示该模块下所有『课时N_*.md』都发。",
+
+  "publishFaq": false,
+  "_publishFaq说明": "FAQ 里可能有学生原话，公开前必须逐条人工过一遍。",
+
+  "publishGradingDimensions": false,
+  "_publishGradingDimensions说明": "评分维度如果公开，学生就知道批改看什么。这未必是坏事，但属于教学决定，默认不公开。",
+
+  "includeReadme": false,
+  "_includeReadme说明": "各目录的 README.md 是教师自用导航，默认不发。",
+
+  "chapters": [],
+  "_chapters说明": "公开仓里要不要暴露课件章节（第一/二/三章）？课件 PPT 通常不适合直接公开，留空即不暴露。",
+
+  "webpDir": ".webp-out",
+  "_webpDir说明": "课件图片发哪一份。由 tools/to_webp.py 生成到 .webp-out/<章>/<文件名>.webp，体积约为原 PNG 的 30%。原始 media/ 有 89.5 MB，其中两个 GIF 占 39.9 MB、四个 MP4 占 45.2 MB —— MP4 不进公开仓（是 PPT 内嵌录屏片段，不是课程主体）。",
+
+  "keepInPublic": ["LICENSE", "_关于本仓.md"],
+  "_keepInPublic说明": "仓库级文件（不属于任何发布的教案），由人工维护、不参与自动生成。列在这里 = 工具认可它们合法存在，不会在泄漏检查里报警。LICENSE 来自远端已有的初提交。"
+}
