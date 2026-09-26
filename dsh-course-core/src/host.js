@@ -36,9 +36,34 @@ import { cached, statOf, sameStat, clearCache, cacheInfo, cacheDir } from './cac
 import { resolveLayout, layoutReport } from './layout.js'
 // 版本控制信息：这套面板与课程内容是哪个版本发出去的（老师要据此给学生一条克隆命令）
 import { versionInfo, versionSummary } from './version.js'
+// 首次启动向导的**判断**部分（纯函数）：地址解析、默认落点、目录现状、能不能往下走。
+// 动作部分（起 git、写文件）在本文件 createCore 里的 `setup.*`，因为要用到运行时知识。
+import {
+  parseRepoInput, defaultTargetDir, inspectTarget, judgeTarget, WORKSPACE_MARKER,
+  courseConfigFromIndex, cloneArgs, versionArgs, explainCloneOutput,
+} from './setup.js'
+// 起子进程并**收回输出**（git / 发布工具）。用它而不是 spawnSync 的 encoding：
+// 沙箱不给管道，带 encoding 的 spawnSync 一律 EPERM 且不抛异常。
+import { runCaptured, runOutput, runExitCode } from './run.js'
 
 // ── 工作区解析 ────────────────────────────────────────────────
-const DEFAULT_WORKSPACE = 'C:\\Users\\Administrator\\Desktop\\暑期课程'
+/**
+ * 兜底工作区。**故意留空** —— 这条改动是「通用插件」的地基。
+ *
+ * 这里原来写的是 `'C:\\Users\\Administrator\\Desktop\\暑期课程'`，也就是**教师机
+ * 的绝对路径**。它有两个后果，第二个更坏：
+ *   ① 换一台机器必然落空（学生机、新电脑、CI 都是）；
+ *   ② **在教师本机上它恰好存在**，于是「一个候选都没通过校验」那条分支
+ *      永远走不到 —— 提示写坏了、向导没接上，都不会有人发现。
+ *
+ * 现在留空，解析链就只剩「用户真的配过」的来源（环境变量 / 配置文件）。
+ * 一台没配过的新机器会**如实**得到 resolved:false，界面据此走向导。
+ * 留空时**不再把工作目录当兜底**（那等于换了个写死的路径，只是更难查）。
+ *
+ * 导出保留：verify-workspace-unresolved.mjs 用它判断「本机还有没有内置兜底」，
+ * 并据此选测哪条分支。它现在不该是一个真实存在的目录。
+ */
+const DEFAULT_WORKSPACE = ''
 
 export function readWorkspaceFile(p) {
   try {
@@ -141,7 +166,11 @@ export function listCourses(rootAbs) {
  *        被系统拒绝（目录被运行中的 DSH 占着）—— 所以改成注入，不再动真实目录。
  */
 export function resolveWorkspace(opts = {}) {
-  const defaultWorkspace = opts.defaultWorkspace || DEFAULT_WORKSPACE
+  // 兜底值：显式传进来的优先（测试用），否则内置那个（现在是空串）。
+  // ⚠️ 空串 = **没有兜底**，必须当成「不加这个候选」而不是「把当前目录当兜底」——
+  //    path.resolve('') 会得到进程的工作目录，那等于又写死一个路径，
+  //    而且是「运行 DSH 时恰好站在哪」这种更难查的写死。
+  const defaultWorkspace = opts.defaultWorkspace !== undefined ? opts.defaultWorkspace : DEFAULT_WORKSPACE
   const tried = []
   /** 候选：[说明, 目录, 课程码]；课程码为空表示「这个目录本身就是课程」 */
   const candidates = []
@@ -156,7 +185,9 @@ export function resolveWorkspace(opts = {}) {
   const wf = process.env.CIP_WORKSPACE_FILE || path.join(os.homedir(), '.dsh', 'cip-workspace.txt')
   const fromFile = readWorkspaceFile(wf)
   if (fromFile) roots.push(['配置文件 ' + wf, fromFile])
-  roots.push(['内置默认值（教师机）', defaultWorkspace])
+  // 内置兜底只在**真的配了一个**时才进候选（见 DEFAULT_WORKSPACE 的注释：
+  // 它现在是空串，一台没配过的新机器不该被塞进任何一个目录）。
+  if (defaultWorkspace) roots.push(['内置默认值', defaultWorkspace])
 
   const codes = []
   if (process.env.CIP_COURSE_CODE) codes.push(process.env.CIP_COURSE_CODE)
@@ -193,9 +224,11 @@ export function resolveWorkspace(opts = {}) {
 
   // ── 一个候选都没通过校验：**必须说人话，不能静默给一个不存在的目录** ──────────
   //
-  // 为什么会走到这里：解析链的最后一环是 `DEFAULT_WORKSPACE`，而那是**教师机的
-  // 绝对路径**（见文件顶部常量）。在教师本机上它恰好存在，于是永远命中、永远
-  // 不报错 —— 换一台机器（新电脑、学生机、CI）就必然落空。
+  // 谁会走到这里（**这条分支现在已经变成常态了，不再是"教师机上永远走不到"**）：
+  // 兜底值 `DEFAULT_WORKSPACE` 以前是教师机的绝对路径，在教师本机上恰好存在，
+  // 于是这条分支永远命不中 —— 换一台机器（新电脑、学生机、CI）就必然落空，
+  // 而落空的表现过去是「面板空着、一句提示都没有」。现在兜底是空串，
+  // **一台没配过工作区的机器就会如实走到这里**，界面据此进首次启动向导。
   //
   // 踩过的坑：原来的实现是
   //     return { dir: path.resolve(first[1]), how: first[0] + '（未验证）' }
@@ -203,9 +236,12 @@ export function resolveWorkspace(opts = {}) {
   // 不存在的目录继续往下跑：面板空着、没有任何一处报错，老师只能靠猜。
   //
   // 现在：dir 仍然给一个**能安全拼接的字符串**（保持向后兼容，避免下游 path.join 崩），
-  // 但把「没解析成功」变成**机器可判的字段** resolved:false，并由 warn() 打出一条
-  // 带修复办法的明确提示。
-  const fallback = roots[roots.length - 1][1]
+  // 但把「没解析成功」变成**机器可判的字段** resolved:false。
+  //
+  // ⚠️ 没有任何候选时**不能**回落到 `path.resolve('')` —— 那是进程的工作目录，
+  //    等于又写死一个「运行时恰好站在哪」的路径，比原来那个更难查。
+  //    所以这里落到**配置文件名本身**（一个明确不存在、且能安全拼接的路径）。
+  const fallback = roots.length ? roots[roots.length - 1][1] : wf
   return {
     dir: path.resolve(fallback),
     courseDir: path.resolve(fallback),
@@ -216,10 +252,24 @@ export function resolveWorkspace(opts = {}) {
     resolved: false,
     // 失败时提示里要给出**可照抄**的修复办法，所以把兜底值也带上
     defaultWorkspace,
+    /** 没配过时该往哪写：界面上的首次启动向导要用它 */
+    workspaceFile: wf,
   }
 }
 
 // ── 常量 ──────────────────────────────────────────────────────
+/**
+ * git 本体在哪。
+ *
+ * ⚠️ 教师机上 git 在 `D:\Git\cmd\git.exe`，而**它未必在 PATH 里** ——
+ *    面板进程是 DSH 拉起来的，继承的是 DSH 自己的环境。只写 'git' 会得到
+ *    ENOENT，报出来却是「找不到 git」，明明装了。
+ *    所以先试写死的路径，再回落 PATH 里的 `git`。
+ */
+export function gitBin() {
+  return fs.existsSync('D:\\Git\\cmd\\git.exe') ? 'D:\\Git\\cmd\\git.exe' : 'git'
+}
+
 export const CHAPTERS = ['第一章', '第二章', '第三章']
 export const MODULES = ['模块一', '模块二', '模块三', '模块四', '模块五']
 export const TYPES = ['概念问题', '代码报错', '环境问题', '数值稳定性', '作业疑问', '讲义问题', '内容建议']
@@ -708,15 +758,19 @@ export function reportUnresolvedWorkspace(WS, workspace, label, logger = console
   if (typeof warn !== 'function') return false
   const p = (s) => warn.call(logger, '[' + label + '] ' + s)
   p('⚠ 没找到课程工作区：' + workspace)
-  p('   最常见的原因是：这是另一台机器（新电脑/学生机/CI），而解析链的兜底是一个'
-    + '"教师机绝对路径"，只在教师本机上成立。')
-  p('   修法（任选一条，改完重启 DSH）：')
+  p('   这台机器还没有配过课程工作区（解析链里不再有任何"写死的内置路径"了 ——'
+    + '以前那个兜底是教师机绝对路径，在别的机器上必然落空，而且落空时不报错）。')
+  p('   最省事的修法：**打开面板，它会给出首次启动向导** —— 填一个公开仓地址，'
+    + '插件直接 clone 下来并配好，不用手敲命令。')
+  p('   想手工配也可以（任选一条，改完重启 DSH）：')
   p('     ① 设环境变量 CIP_WORKSPACE=<你的课程工作区目录>')
-  p('     ② 或把这一行目录写进 ' + path.join(os.homedir(), '.dsh', 'cip-workspace.txt'))
+  p('     ② 或把这一行目录写进 ' + path.join(os.homedir(), '.dsh', 'cip-workspace.txt')
+    + (WS && WS.workspaceFile && path.resolve(WS.workspaceFile) !== path.resolve(path.join(os.homedir(), '.dsh', 'cip-workspace.txt'))
+      ? '（这台机器上被 CIP_WORKSPACE_FILE 指到了 ' + WS.workspaceFile + '）' : ''))
   p('        （在课程仓根目录跑 templates/install.ps1 会自动写）')
   p('     ③ 共享式布局再加 CIP_COURSE_CODE=<课程码>，定位到 <根>' + path.sep + '课程' + path.sep + '<课程码>')
   p('   判据：该目录下要有「课程中心' + path.sep + '课程结构索引.json」。')
-  p('   尝试过的候选：' + (WS && WS.tried && WS.tried.length ? WS.tried.join(' | ') : '（一个都没通过校验）'))
+  p('   尝试过的候选：' + (WS && WS.tried && WS.tried.length ? WS.tried.join(' | ') : '（一个候选都没有 —— 没配过）'))
   return true
 }
 
@@ -738,16 +792,23 @@ export function msg(role, text, provider, model) {
 export function createCore(ctx, opts) {
   const { prefix, role, pkgRoot, label } = opts
   const isTeacher = role === 'teacher'
-  const WS = resolveWorkspace()
-  const WORKSPACE = WS.dir
+  /**
+   * 工作区解析结果 —— ⚠️ `let` 而不是 `const`：**首次启动向导**会在同一个进程里
+   * 把它换掉（clone 完立刻就能用，不必让用户重启 DSH）。
+   *
+   * 为什么敢在运行中换：向导那一步是**同步**换完 `WS / WORKSPACE / COURSE_DIR /
+   * COURSE` 四个值再清缓存的 —— Node 单线程，中间插不进任何别的请求。
+   * 这个理由与 useCourse（换课）完全一样，那边也是 `let`。
+   * 一旦有人把它改成 await，就会出现「一个请求读到新工作区、另一个读到旧的」，
+   * 而且是静默串数据。
+   */
+  let WS = resolveWorkspace()
+  let WORKSPACE = WS.dir
   /**
    * 课程私有数据的根。共享式布局里它是 <根>/课程/<课程码>，旧布局里等于 WORKSPACE。
    *
-   * ⚠️ 是 `let` 而不是 `const`：老师可以**在面板里换课**（见下面的 useCourse）。
-   *    这不只是省一次重启 —— `abs()`、`courseAbs()`、`COURSE` 全都读它，
-   *    热切换能在**同一个同步块里**把三个一起换掉，Node 是单线程的，
-   *    所以不存在「一个请求读到半切换状态」的窗口。
-   *    若改成异步（比如 await 一下再换），那个窗口就出现了，而且是静默串数据。
+   * ⚠️ 是 `let` 而不是 `const`：老师可以**在面板里换课**（见下面的 useCourse），
+   *    首次启动向导也会换它（换了工作区，课程目录当然跟着换）。
    */
   let COURSE_DIR = WS.courseDir || WS.dir
   const fsMod = ctx.get('fs')
@@ -889,6 +950,278 @@ export function createCore(ctx, opts) {
     COURSE = readCourseConfig([COURSE_DIR, WORKSPACE])
     invalidateCache()
     return { ok: true, code: COURSE.code || '', dir: COURSE_DIR, shared: false }
+  }
+
+  // ── 首次启动向导 ─────────────────────────────────────────────
+  /**
+   * 把某个目录**认成**当前工作区（同步换掉四个值 + 清缓存）。
+   *
+   * ⚠️ 必须同步（理由同 useCourse）：`WS / WORKSPACE / COURSE_DIR / COURSE`
+   *    四个值要么一起换，要么不换。中间一旦有 await，别的请求就会读到
+   *    「新工作区 + 旧课程配置」这种组合，而它不会报错，只会串数据。
+   *
+   * 认之前**必须**自己再校验一次结构索引：调用方（向导）已经校验过一遍，
+   * 但那个校验发生在**写配置之前**，而这里是最后一道 —— 认错了的后果是
+   * 面板从此指向一个空目录，直到有人手工改回配置文件。
+   */
+  function adoptWorkspace(dirAbs, how) {
+    const abs = path.resolve(dirAbs)
+    const marker = path.join(abs, WORKSPACE_MARKER[0], WORKSPACE_MARKER[1])
+    if (!fs.existsSync(marker)) {
+      return { ok: false, error: '这个目录不是课程工作区（缺 课程中心\\课程结构索引.json）：' + abs }
+    }
+    WS = {
+      dir: abs, courseDir: abs, courseCode: '', resolved: true,
+      how: how || '首次启动向导', tried: [abs + ' ✓'], shared: false,
+      workspaceFile: WS.workspaceFile || defaultWorkspaceFile(),
+    }
+    WORKSPACE = abs
+    COURSE_DIR = abs
+    COURSE = readCourseConfig([COURSE_DIR, WORKSPACE])
+    /**
+     * ⚠️ 课名从**索引**里补一道，因为这一步紧跟在「刚 clone 下来」后面：
+     *    `readCourseConfig` 只读 `课程配置.json`，而那份配置是 ensureCourseConfig()
+     *    在**这之后**才写的 —— 于是这一刻 COURSE.title 还是内置默认名。
+     *    后果不是显示不好看：`setupUse` 把 `adopted.course` 当作「真课名」回给界面
+     *    （让用户核对「这是不是我那门课」），拿到默认名就等于让他核对了一个假信息。
+     *    验收当场抓到这一条（断言：返回里带真课名）。
+     *
+     * 顺序有意为之：先读配置（用户手工填的 code/goal 优先），再用索引补**空**的字段。
+     */
+    try {
+      const idx = JSON.parse(fs.readFileSync(marker, 'utf8'))
+      // ⚠️ 判据是「title 还是**内置默认值**」，不是「title 非空」——
+      //    readCourseConfig 读不到配置时给的就是占位名「深度学习课程」，
+      //    那个值**非空**，所以写成 `!COURSE.title` 会让补写永远不发生。
+      //    手误成 `!oneLine('')` 更坏：恒为真，每次向导都把真课名冲掉。
+      //    这一步是「用户核对这是不是我那门课」的信息来源，说错了就是让他核对假信息。
+      if (idx && idx.course && oneLine(COURSE.title) === COURSE_DEFAULTS.title) {
+        COURSE = Object.assign({}, COURSE, { title: String(idx.course) })
+      }
+      // 索引里有课程码时也补上（面板要用它拼仓名 / 默认落点）
+      if (idx && idx.code && !oneLine(COURSE.code)) {
+        COURSE = Object.assign({}, COURSE, { code: String(idx.code) })
+      }
+    } catch (e) { /* 索引读不动就保持默认名，不影响把工作区认下来 */ }
+    invalidateCache()
+    return { ok: true, dir: WORKSPACE, course: COURSE.title || '', how: WS.how }
+  }
+
+  /** 配置文件路径（解析链真的会去读的那一个）。 */
+  function defaultWorkspaceFile() {
+    return process.env.CIP_WORKSPACE_FILE || path.join(os.homedir(), '.dsh', 'cip-workspace.txt')
+  }
+
+  /**
+   * 把工作区路径写进配置文件 —— **下一次启动也能找到它**。
+   *
+   * ⚠️ 写不进去**不是致命错误**：这一步只是让下次启动省事，而本次进程已经
+   *    通过 adoptWorkspace() 认下了这个目录。所以调用方拿到 ok:false 时，
+   *    应该把原因显示出来（多半是沙箱/权限），但**不要**因此把整次向导判失败 ——
+   *    用户的课已经装好了，只是下次开机要重来一遍向导。
+   *
+   * 带 BOM 的写法是错的：`readWorkspaceFile` 会剥掉 BOM，但别的工具不一定，
+   * 而路径前多一个看不见的字符会让 existsSync 一律为假 —— 那是最难查的一类。
+   */
+  function writeWorkspaceFile(dirAbs) {
+    const wf = defaultWorkspaceFile()
+    try {
+      fs.mkdirSync(path.dirname(wf), { recursive: true })
+      const lines = [
+        '# 课程工作区路径 —— 由面板的「首次启动向导」写入，供课程面板插件读取。',
+        '# 想换位置（比如把仓挪走了），改这一行即可；也可以用环境变量 CIP_WORKSPACE 覆盖。',
+        path.resolve(dirAbs),
+      ]
+      fs.writeFileSync(wf, lines.join('\r\n') + '\r\n', 'utf8')
+      return { ok: true, file: wf }
+    } catch (e) {
+      return {
+        ok: false, file: wf,
+        error: '工作区已经认下来了，但**写不进配置文件**（' + oneLine(e && e.message) + '）。'
+          + '本次可以用；下次启动面板还会再问一次。想一劳永逸，手工把这一行写进 ' + wf + '：'
+          + path.resolve(dirAbs),
+      }
+    }
+  }
+
+  /**
+   * 把真课名写进 `课程配置.json`（与 install.ps1 的 4c 步同一个口径）。
+   *
+   * 为什么向导也要做这一步：走到向导的机器通常**没跑过 install.ps1**
+   * （那正是它落空的原因）。不写这份配置的话，面板顶栏会显示内置默认名，
+   * 而真课名就躺在刚 clone 下来的索引里 —— 学生第一眼看到的就是错的课名。
+   *
+   * 已经存在就**不覆盖**：用户可能手工填过 code / goal / 章的映射，
+   * 那些索引里没有，覆盖等于把他填的删掉。只在缺的时候补一份，并把
+   * 索引里有的字段补进缺失项。
+   */
+  function ensureCourseConfig(dirAbs) {
+    const cfgPath = path.join(dirAbs, COURSE_CONFIG_REL)
+    const idxPath = path.join(dirAbs, WORKSPACE_MARKER[0], WORKSPACE_MARKER[1])
+    let idx = null
+    try { idx = JSON.parse(fs.readFileSync(idxPath, 'utf8')) } catch (e) { idx = null }
+    if (!idx) return { ok: false, error: '读不到课程结构索引，没法写课程配置：' + idxPath }
+    const fresh = courseConfigFromIndex(idx, { sourceNote: '由面板的首次启动向导生成（从 课程中心\\课程结构索引.json）' })
+    let existed = false
+    try {
+      if (fs.existsSync(cfgPath)) {
+        existed = true
+        const cur = JSON.parse(fs.readFileSync(cfgPath, 'utf8'))
+        let changed = false
+        // 只补**空**的：title 空就填真课名；code 空就填课程码。
+        for (const k of ['title', 'code']) {
+          if (!String(cur[k] || '').trim() && fresh[k]) { cur[k] = fresh[k]; changed = true }
+        }
+        if (!cur.layout || typeof cur.layout !== 'object') { cur.layout = fresh.layout; changed = true }
+        if (changed) fs.writeFileSync(cfgPath, JSON.stringify(cur, null, 2), 'utf8')
+        return { ok: true, file: cfgPath, existed: true, changed }
+      }
+    } catch (e) {
+      // 配置坏了不能把向导弄挂：重写一份好的，并把坏的那份留个备份名。
+      try { fs.renameSync(cfgPath, cfgPath + '.bak') } catch (e2) { /* 留不下备份也继续 */ }
+    }
+    fs.writeFileSync(cfgPath, JSON.stringify(fresh, null, 2), 'utf8')
+    return { ok: true, file: cfgPath, existed, changed: true }
+  }
+
+  /**
+   * 向导要的全部状态。
+   *
+   * ⚠️ `workspaceResolved` 是**唯一**决定界面要不要提示「先去配工作区」的字段；
+   *    这里再算一遍而不是复用 `WS.resolved`，是为了让 adoptWorkspace 之后就立刻
+   *    变 true（同一个进程里不再提示），不用等重启。
+   */
+  function setupState() {
+    const wf = defaultWorkspaceFile()
+    const home = os.homedir()
+    let dirs = []
+    try {
+      dirs = fs.readdirSync(home, { withFileTypes: true })
+        .filter((e) => e.isDirectory() && /^DSH-/i.test(e.name))
+        .map((e) => {
+          const p = path.join(home, e.name)
+          const marker = path.join(p, WORKSPACE_MARKER[0], WORKSPACE_MARKER[1])
+          return { dir: p, looksLikeWorkspace: fs.existsSync(marker) }
+        })
+        .slice(0, 8)
+    } catch (e) { dirs = [] }
+    return {
+      workspaceResolved: WS.resolved !== false,
+      workspace: WORKSPACE,
+      how: WS.how,
+      tried: WS.tried || [],
+      workspaceFile: wf,
+      // 用户以前 clone 过的课（`~/DSH-*`）：新机器上多半就是它，
+      // 摆出来比让他重新敲一遍路径省事。
+      nearby: dirs,
+      home,
+      // 界面据此拼默认落点（`~/DSH-<课程码>`）—— 规则在 setup.js 里，只有一份
+      courseTitle: COURSE.title || '',
+      courseCode: COURSE.code || '',
+      role,
+    }
+  }
+
+  /**
+   * `setup.clone`：把公开仓 clone 到落点，然后校验 + 认下来 + 写配置。
+   *
+   * 顺序是刻意的，每一步失败都有不同的说法：
+   *   ① 解析地址（错了就没必要往下走）
+   *   ② 看落点现状（**绝不覆盖**别人的目录）
+   *   ③ clone（失败时把 git 原文与推断原因一起给出来）
+   *   ④ 校验结构索引（这是「解析器认工作区的唯一依据」）
+   *   ⑤ 认下来（同步换值）→ ⑥ 写配置文件 + 课程配置（失败不影响本次可用）
+   */
+  async function setupClone(input) {
+    const repoInput = oneLine(input.repo)
+    const parsed = parseRepoInput(repoInput)
+    if (!parsed.ok) return { ok: false, step: 'parse', error: parsed.error }
+    const wantDir = oneLine(input.dir) || defaultTargetDir(os.homedir(), parsed.name, COURSE.code)
+    const target = path.resolve(wantDir)
+    const state = inspectTarget(target, {
+      exists: (p) => fs.existsSync(p),
+      isDir: (p) => { try { return fs.statSync(p).isDirectory() } catch (e) { return false } },
+      listDir: (p) => { try { return fs.readdirSync(p) } catch (e) { return [] } },
+    })
+    const verdict = judgeTarget(state)
+    if (!verdict.ok && verdict.mode === 'use-existing') {
+      // 已经是仓库：不 clone，直接问「要不要就用它」—— 这多半是用户指到了自己的旧 clone
+      const adopted = adoptWorkspace(target, '首次启动向导（已有仓库）')
+      if (adopted.ok) {
+        const cfg = ensureCourseConfig(target)
+        const wf = writeWorkspaceFile(target)
+        return { ok: true, mode: 'existing', dir: target, state, steps: [{ cmd: '（已在本地，未 clone）', code: 0, out: '' }], courseConfig: cfg, workspaceFile: wf }
+      }
+      return { ok: false, step: 'inspect', error: verdict.note }
+    }
+    if (!verdict.ok) return { ok: false, step: 'inspect', error: verdict.note, state }
+
+    const git = gitBin()
+    const probe = runCaptured(git, versionArgs(), { timeout: 20000, hintDir: findWriteHint() })
+    if (runExitCode(probe) !== 0) {
+      return {
+        ok: false, step: 'git',
+        error: '这台机器上跑不了 git（' + git + '）：' + (runOutput(probe) || '没有输出')
+          + '　git 是 clone 与后续「拉取更新」都要用的东西，先装它（或把它放进 PATH）再回来。',
+      }
+    }
+    fs.mkdirSync(path.dirname(target), { recursive: true })
+    const args = cloneArgs(parsed.remote, target)
+    const r = runCaptured(git, args, { timeout: 600000, hintDir: findWriteHint() })
+    const explained = explainCloneOutput(r, parsed.name)
+    const steps = [{ cmd: 'git ' + args.join(' '), code: runExitCode(r), out: runOutput(r).slice(-4000) }]
+    if (!explained.ok) return { ok: false, step: 'clone', error: explained.why, steps, remote: parsed.remote, dir: target }
+
+    // ④ 校验：只有结构索引存在才算「真的是一份课程仓」。
+    //    这条判据不猜 —— host.js 的 looksLikeWorkspace() 用的也是它。
+    const marker = path.join(target, WORKSPACE_MARKER[0], WORKSPACE_MARKER[1])
+    if (!fs.existsSync(marker)) {
+      return {
+        ok: false, step: 'verify', steps, remote: parsed.remote, dir: target,
+        error: 'clone 成功了，但这个仓里没有「' + WORKSPACE_MARKER.join('\\') + '」——'
+          + '它可能只是一个空仓、或者不是课程仓（老师那边还没发布过）。'
+          + '请找老师确认公开仓，或改填另一个地址。落点：' + target,
+      }
+    }
+    const adopted = adoptWorkspace(target, '首次启动向导（clone 下来的）')
+    if (!adopted.ok) return { ok: false, step: 'verify', error: adopted.error, steps, dir: target }
+    const cfg = ensureCourseConfig(target)
+    const wf = writeWorkspaceFile(target)
+    return {
+      ok: true, mode: 'clone', dir: target, remote: parsed.remote, steps,
+      course: adopted.course, courseConfig: cfg, workspaceFile: wf,
+    }
+  }
+
+  /**
+   * `setup.use`：工作区**已经在**本机（手工 clone 过 / 从别处拷来的），只是没配过。
+   * 不 clone、不联网，只校验 + 认下来 + 写配置。这一档在新机器上很常见
+   * （用户其实已经把仓拷过来了，只是不知道要写配置文件）。
+   */
+  function setupUse(input) {
+    const wantDir = oneLine(input.dir)
+    if (!wantDir) return { ok: false, step: 'parse', error: '还没填目录。' }
+    const target = path.resolve(wantDir)
+    if (!fs.existsSync(target)) {
+      return { ok: false, step: 'inspect', error: '这个目录不存在：' + target }
+    }
+    const adopted = adoptWorkspace(target, '首次启动向导（指定已有目录）')
+    if (!adopted.ok) return { ok: false, step: 'verify', error: adopted.error }
+    const cfg = ensureCourseConfig(target)
+    const wf = writeWorkspaceFile(target)
+    return { ok: true, mode: 'existing', dir: target, course: adopted.course, courseConfig: cfg, workspaceFile: wf }
+  }
+
+  /** runCaptured 的临时文件落点提示：工作区可能是空的，用一个必然可写的目录。 */
+  function findWriteHint() {
+    try { return fs.existsSync(WORKSPACE) ? WORKSPACE : os.homedir() } catch (e) { return undefined }
+  }
+
+  /** 向导的动作集合。各插件在自己的 handlers 里 `...core.setupHandlers` 合并进去。 */
+  const setupHandlers = {
+    'setup.info': async () => setupState(),
+    'setup.clone': async (args) => setupClone(args && typeof args === 'object' ? args : {}),
+    'setup.use': async (args) => setupUse(args && typeof args === 'object' ? args : {}),
   }
 
   async function loadIndex() {
@@ -1766,6 +2099,17 @@ export function createCore(ctx, opts) {
     cached, statOf, sameStat, clearCache, cacheInfo, cacheDir,
     // 路由
     registerApi, registerStatic, registerMedia, registerSubmissions, mount, routes, readBodyForTest: null,
+    // ── 首次启动向导 ──────────────────────────────────────────────
+    //
+    // 为什么是**另一个键**（setupHandlers）而不是并进各插件的 handlers 里：
+    // 向导是「内核的能力」，学生端与教师端都要有（学生换台机器、老师换台机器
+    // 是同一件事），而两端的 handlers 是各写各的。给一个现成的对象让它们展开，
+    // 就不存在「一端加了、另一端忘了」这种半成品状态。
+    //
+    // ⚠️ 各插件必须以 `...core.setupHandlers` 的形式合并进去才会真的挂上路由
+    //    （有断言守着，见 verify-setup-wizard.mjs）。
+    setupHandlers,
+    setupState,
     // 诊断
     info: () => {
       // 版本信息：**这套面板与课程内容是哪个版本**。
@@ -1781,6 +2125,10 @@ export function createCore(ctx, opts) {
       const vi = versionInfo(WORKSPACE, { withRemote: false })
       return {
         workspace: WORKSPACE, workspaceHow: WS.how, workspaceTried: WS.tried,
+        // 首次启动向导需要的三样：配没配过、配置文件在哪、旁边有没有现成的课。
+        // ⚠️ 一起放在 info() 里是有意的：客户端**每次拉 info 都会看到当前状态**，
+        //    所以向导认下工作区之后，界面不需要任何额外的「重新读一次」就能变。
+        setup: setupState(),
       // 两个字段判的不是一回事，都要留着：
       //   workspaceResolved     = 解析链**有没有一个候选通过校验**（配置层面）
       //   workspaceLooksValid   = 解析出来的目录**里有没有「课程中心」**（数据层面）

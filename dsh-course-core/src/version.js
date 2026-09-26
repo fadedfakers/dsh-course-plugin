@@ -153,7 +153,16 @@ export function versionInfo(dirAbs, opts = {}) {
     out.remoteName = remote
   }
 
-  if (o.withRemote !== false && remote && out.branch && out.branch !== '(detached)') {
+  if (!remote) {
+    out.note = '还没配远端仓库'
+  } else if (o.withRemote === false) {
+    // ⚠️ 这一支以前是**漏的**，而症状很隐蔽：调用方传 `withRemote:false`
+    //    （离线也能用的那一档）时 note 是**空串** —— 一块明明写着「本机是哪个版本」
+    //    的卡片上，那句「没和远端比对」的说明凭空消失，看起来像「已经比对过了」。
+    //    是发布页的真机验收（acceptance-publish.mjs 第 8 节）把它逼出来的：
+    //    那里需要一个**能证伪**的判据来证明这一档真的没联网，而空 note 无法证伪。
+    out.note = '未与远端比对'
+  } else if (out.branch && out.branch !== '(detached)') {
     const gitOk = fs.existsSync('D:\\Git\\cmd\\git.exe')
     const git = gitOk ? 'D:\\Git\\cmd\\git.exe' : 'git'
     const r = runCaptured(git, ['-C', dirAbs, 'ls-remote', 'origin', 'refs/heads/' + out.branch],
@@ -167,14 +176,17 @@ export function versionInfo(dirAbs, opts = {}) {
         // 所以这里只报「跟远端不一致」，并把两边 SHA 都给出来 ——
         // 不假装知道差几个提交（那需要 fetch，代价与本机状态都不可控）。
         out.note = '本地 ' + out.commitShort + ' 与远端 ' + out.remoteCommit.slice(0, 7) + ' 不一致'
+      } else {
+        out.note = ''
       }
     } else {
       // 「连不上远端」是**常态**（离线、代理没开、教室网络），不该写成错误。
       // 它只说明「没法替你确认远端有没有更新」，不影响「本地是哪个版本」这个结论。
       out.note = '未与远端比对'
     }
-  } else if (!remote) {
-    out.note = '还没配远端仓库'
+  } else {
+    // 有远端但处于 detached HEAD：没法说「比对哪个分支」，如实说没比。
+    out.note = '未与远端比对'
   }
   return out
 }

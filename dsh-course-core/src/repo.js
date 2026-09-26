@@ -160,6 +160,42 @@ export function manualSteps(owner, name, opts) {
 }
 
 /**
+ * 版本比对 → 一句**结论**：学生照那条 clone 命令，现在会拿到哪一份。
+ *
+ * 为什么抽成纯函数（而不是留在教师端动作体内、看着返回值现场拼）：
+ * 它是这一整块里唯一「说错了也没人发现」的东西 —— 说「一致」而实际不一致，
+ * 表现是学生 clone 到旧面板、只报一些莫名其妙的「未知动作」；
+ * 说「不一致」而实际一致，老师会白推一次。两种都不报错。
+ * 写成纯函数，各种组合（没查过 / 连不上 / 远端是空的 / 一致 / 不一致）
+ * 就能在构建门里逐条钉死。
+ *
+ * `checked` 这个入参是**必须**的：不能靠 `remoteCommit` 为空来推
+ * 「没查过」还是「远端是空的」—— 那是两件完全不同的事，
+ * 前者应该说「点按钮去比一下」，后者应该说「学生 clone 会拿到空目录」。
+ *
+ * @param {object|null} pub  versionInfo() 在公开仓上的返回
+ * @param {boolean} checked  到底有没有真的和远端比对过（= 调用方传了 withRemote:true 且 ls-remote 成功）
+ * @returns {{level:string,text:string}|null} null = 没有额外结论可说（本机事实已在摘要里）
+ */
+export function versionVerdict(pub, checked) {
+  const v = pub || {}
+  if (!v.hasRepo) return { level: 'none', text: '公开仓还没在这台机器上准备好，暂时没有能给学生克隆的东西。' }
+  if (!v.remoteName) return { level: 'warn', text: '公开仓还没连到 GitHub，学生现在没有可克隆的地址。' }
+  if (!checked) return null
+  if (!v.remoteCommit) {
+    return { level: 'warn', text: 'GitHub 上的公开仓还是空的（没有推送过任何提交）—— 学生照这条命令会 clone 到一个空目录。' }
+  }
+  if (v.remoteCommit === v.commit) {
+    return { level: 'ok', text: 'GitHub 上的内容与本机一致：学生照那条命令克隆，拿到的就是这个版本。' }
+  }
+  return {
+    level: 'warn',
+    text: 'GitHub 上是 ' + String(v.remoteCommit).slice(0, 7) + '，这台机器上是 '
+      + (v.commitShort || '?') + ' —— 两边不一样：学生现在克隆会拿到 GitHub 上那一份。',
+  }
+}
+
+/**
  * 建仓请求体。纯函数 —— 真正发请求的那一步在宿主里，
  * 但请求体长什么样必须能单独看、单独测（写错了 GitHub 会回一句很含糊的错）。
  */

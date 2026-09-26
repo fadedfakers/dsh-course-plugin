@@ -1381,6 +1381,131 @@ window.__ModuleLoader__.load({
           : null)
     }
 
+    // ── 首次启动向导 ──
+    /**
+     * 「这台机器还没配过课程工作区」时唯一该看到的东西。
+     *
+     * ── 为什么需要它 ──────────────────────────────────────────────────────
+     * 插件现在是**通用**的：任意课程、任意仓。而在这之前，一台新机器要能跑起来，
+     * 得先有人手工跑 `templates/install.ps1`（写 `~/.dsh/cip-workspace.txt`）
+     * 或者手工设 `CIP_WORKSPACE` —— 漏掉这一步的症状是**面板空着、一句话都没有**，
+     * 因为解析链的兜底原来是教师机绝对路径，在别的机器上必然落空，落空时又不报错。
+     *
+     * 现在兜底留空了（见 core/host.js 的 DEFAULT_WORKSPACE），落空会如实变成
+     * `info.setup.workspaceResolved === false`，界面据此进这个向导。
+     *
+     * ── 三步，动作全在宿主（core 的 setup.*）────────────────────────────────
+     *   ① 填公开仓地址（老师发在群里那一条）
+     *   ② 落点默认 `~/DSH-<课程码>` —— **允许改**（老师定的：向导里可改）
+     *   ③ clone → 校验 `课程中心/课程结构索引.json` → 认下来 → 写配置文件
+     *
+     * ── 为什么还要「工作区已经在别的目录」这一栏 ────────────────────────────
+     * 新机器上这其实是**最常见**的一档：用户手里已经有一个 clone（U 盘拷的、
+     * 上次装过、老师直接给的压缩包），只是没人告诉他「插件要读一个配置文件」。
+     * 让他重新 clone 一遍是浪费带宽，也是让他怀疑自己做错了什么。
+     *
+     * ⚠️ 这一段在两个客户端里是**同一份代码**（学生端 / 教师端各一份副本）。
+     *    改一处必须改两处 —— verify-setup-wizard.mjs 里有一条断言在比对两边的
+     *    函数体是否逐字一致，忘了改另一边会当场变红。
+     */
+    function SetupWizard({ info, api, onDone }) {
+      const sp = (info && info.setup) || {}
+      const loaded = !!(info && info.setup)
+      const resolved = sp.workspaceResolved !== false
+      const [repo, setRepo] = React.useState('')
+      const [dir, setDir] = React.useState('')
+      // 落点**只在第一次算出来之后允许用户改**：所以这里不是「每次渲染都重置」，
+      // 而是「用户没填过就用宿主给的建议」。老师定的：默认 `~/DSH-<课程码>`，向导里可改。
+      const [mode, setMode] = React.useState('clone')
+      const [open, setOpen] = React.useState(false)
+      const [busy, setBusy] = React.useState(false)
+      const [result, setResult] = React.useState(null)
+      const [err, setErr] = React.useState('')
+      const suggestedDir = (sp.home || '') + '\\DSH-' + (sp.courseCode || 'course')
+      const dirValue = dir || suggestedDir
+      // 宿主没给出 setup（老宿主半区没重启）时**不能装死**：那种情况下
+      // 面板会是空的，而用户连「为什么空」都看不到。
+      if (!loaded) {
+        return h('div', { className: 'k52 k53', style: { margin: '8px 14px 0' } },
+          '课程面板没有拿到工作区信息（多半是宿主半区没重启）。'
+          + '这条信息是「你在看哪门课」的来源，缺了它整块面板都是空的。')
+      }
+      // 已经配好了：**什么都不显示**。这块只在「没配过」时出现 ——
+      // 一个长期挂在面板顶上的设置块，会让人以为每次都要点它。
+      if (resolved) return null
+
+      const callClone = async () => {
+        setBusy(true); setErr(''); setResult(null)
+        try {
+          const r = await api('setup.clone', { repo: repo, dir: dirValue })
+          if (r && r.ok) { setResult(r); await onDone() } else { setErr((r && r.error) || 'clone 失败（宿主没给原因）') }
+        } catch (e) { setErr('' + ((e && e.message) || e)) } finally { setBusy(false) }
+      }
+      const callUse = async () => {
+        setBusy(true); setErr(''); setResult(null)
+        try {
+          const r = await api('setup.use', { dir: dirValue })
+          if (r && r.ok) { setResult(r); await onDone() } else { setErr((r && r.error) || '没认下来（宿主没给原因）') }
+        } catch (e) { setErr('' + ((e && e.message) || e)) } finally { setBusy(false) }
+      }
+      const steps = (result && result.steps) || []
+      const wf = (result && result.workspaceFile) || null
+      return h('div', { className: 'kcb', 'data-role': 'cip-setup' },
+        h('div', { className: 'k64' }, '① 先把这台机器配好'),
+        h('div', { className: 'kd1' }, '课程面板要读一份**课程工作区**（课件、结构索引、问题池都在里面）。'
+          + '这台机器还没有它 —— 填一个地址，插件替你把它取下来。'),
+        h('div', { className: 'k57' }, '宿主说这次没找到工作区的过程：' + (sp.how || '（没说）')),
+        h('div', { className: 'kce' },
+          h('span', { className: 'k57' }, '公开仓地址'),
+          h('input', {
+            className: 'k61', style: { flex: '1 1 320px', maxWidth: '460px' },
+            value: repo, placeholder: 'https://github.com/<owner>/<仓名>.git（老师发的那一条）',
+            onChange: (e) => setRepo(e.target.value),
+          })),
+        h('div', { className: 'kce' },
+          h('span', { className: 'k57' }, '放到哪里'),
+          h('input', {
+            className: 'k61', style: { flex: '1 1 320px', maxWidth: '460px' },
+            value: dirValue, onChange: (e) => setDir(e.target.value),
+          })),
+        h('div', { className: 'k57' }, '默认落在这里（可以改）：' + suggestedDir),
+        h('div', { className: 'kca' },
+          h('button', { className: 'k42 k11', disabled: busy || !repo.trim(), onClick: callClone },
+            busy ? '处理中…（第一次 clone 可能要几十秒）' : '取下来，配好'),
+          h('button', { className: 'k42', disabled: busy, onClick: () => setOpen(!open) },
+            open ? '收起更多选项' : '更多选项')),
+        open
+          ? h('div', null,
+            h('div', { className: 'k64' }, '工作区已经在别的目录'),
+            h('div', { className: 'k57' }, '手里已经有这个仓了（U 盘拷的、上次装的、老师给的压缩包）？'
+              + '填它的目录，插件只做校验和登记，不联网、不 clone。'),
+            h('div', { className: 'kca' },
+              h('button', { className: 'k42', disabled: busy || !dirValue.trim(), onClick: callUse },
+                busy ? '处理中…' : '就用这个目录')))
+          : null,
+        // 成功：**留下证据**，不只是说一句「好了」——用户要能核对
+        // 「课名对不对」「落在哪」「用的哪个版本」「配置文件写没写进去」。
+        result
+          ? h('div', { className: 'kc7', 'data-ok': '1' },
+            h('div', { className: 'kc8' },
+              bdg('已配好', 'var(--dsw-alias-state-success-primary)'),
+              h('span', { className: 'k57' }, (result.course ? ('课程：' + result.course + '　') : '')
+                + '工作区：' + result.dir + (result.mode === 'clone' ? '（刚 clone 下来）' : '（用的已有目录）'))),
+            h('div', { className: 'k57' }, '配置文件：' + ((wf && wf.file) || sp.workspaceFile || '')
+              + (wf && wf.ok ? '（已写入）' : '　⚠ 没写进去，下次启动要再来一遍：' + ((wf && wf.error) || ''))),
+            result.courseConfig && !result.courseConfig.ok
+              ? h('div', { className: 'k57' }, '⚠ 课名没写进 课程配置.json：' + result.courseConfig.error)
+              : null,
+            h('div', { className: 'k57' }, '面板已经切到这个工作区了，**不用重启**；下面几块现在就有内容。'))
+          : null,
+        err
+          ? h('div', { className: 'kc7', 'data-err': '1' },
+            h('div', { className: 'kc8' }, bdg('没成功', 'var(--dsw-alias-state-error-primary)'), h('span', { className: 'k57' }, err)),
+            steps.length ? h('div', null, steps.map((s, i) => h('div', { key: i, className: 'k57' }, '· ' + s.cmd + '（exit ' + s.code + '）'))) : null,
+            h('div', { className: 'k57' }, '修好之后点上面的按钮重试即可 —— 已经 clone 下来的东西不会被删。'))
+          : null)
+    }
+
     // ── 面板 ──
     function Panel() {
       const init = {
@@ -1842,6 +1967,10 @@ window.__ModuleLoader__.load({
         // 原来这里只有一个「我是谁」卡片，现在扩成三件事的清单 ——
         // 「面板是空的」有四种完全不同的原因，而界面上看起来一模一样。
         h(ReadinessCard, { st, set, onIdentify }),
+        // 首次启动向导：**这台机器还没配过课程工作区**时唯一该看到的东西。
+        // 放在就绪清单上面 —— 工作区都没有的时候，「还差哪几件事」是空谈。
+        // 已经配好时它自己返回 null（见 SetupWizard 里的注释）。
+        h(SetupWizard, { info: st.info, api: api, onDone: load }),
         st.error ? h('div', { className: 'k52 k53', style: { margin: '8px 14px 0' } }, st.error) : null,
         st.notice ? h('div', { className: 'k52 k62', style: { margin: '8px 14px 0' } }, st.notice) : null,
         st.katexError ? h('div', { className: 'k52 k53', style: { margin: '8px 14px 0' } }, '公式渲染不可用：' + st.katexError) : null,
@@ -1959,7 +2088,7 @@ window.__ModuleLoader__.load({
     // SlideTextChip / pickLabel：框内取字与证据条标题（纯逻辑，决定跨页证据到底带上了什么）
     // LessonForm / LessonPage / Markdown：课时页的验收靠单独驱动它们 ——
     //   三个提交页签是条件渲染的，只渲染外层看不到另外两页的文案。
-    exports.__components = { Panel: Panel, ReadinessCard: ReadinessCard, SlideTextChip: textInBox, pickLabel: pickLabel, LessonForm: LessonForm, LessonPage: LessonPage, Markdown: Markdown }
+    exports.__components = { Panel: Panel, ReadinessCard: ReadinessCard, SetupWizard: SetupWizard, SlideTextChip: textInBox, pickLabel: pickLabel, LessonForm: LessonForm, LessonPage: LessonPage, Markdown: Markdown }
     return module.exports
   },
 })

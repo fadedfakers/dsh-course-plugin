@@ -88,6 +88,9 @@ export async function apply(ctx) {
     // 因为它同样只读仓库事实、不碰 token —— versionInfo 复用了 readRepoState
     // 已经脱敏过的 remoteSafe。
     versionInfo, versionSummary,
+    // 「学生照这条命令会拿到哪一份」的结论规则（纯函数，构建门逐条测）。
+    // ⚠️ 不许在动作体内现场拼这段判断：说错了不报错，只说错。
+    versionVerdict,
     // 起子进程并**收回输出**。必须用它，不能用带 encoding 的 spawnSync ——
     // 沙箱不给管道，那种写法一律 EPERM 且不抛异常（详见 core/src/run.js）。
     runCaptured, runOutput, runExitCode,
@@ -558,6 +561,64 @@ export async function apply(ctx) {
           'git commit -m "首次发布"',
           'git push -u origin ' + branch,
         ],
+      }
+    },
+
+    /**
+     * 版本控制信息（老师的决定：教师端要能看到版本，让学生克隆到**正确的版本**）。
+     *
+     * ── 为什么是一个独立动作，而不是塞进 repo.status ──────────────────────
+     * `repo.status` 是**纯读盘**的（只读 .git/config，不 spawn git、不联网），
+     * 所以离线也能用。试过把版本信息并进去，结果立刻把发布页的真机验收打红：
+     * `versionInfo` 默认会 spawn `git ls-remote` 去比对远端 —— 一个纯读盘的动作
+     * 就这样被拖成了网络依赖，连不上时整块状态都空了。
+     *
+     * 所以分成**两档**，由界面决定什么时候走哪一档：
+     *   · 默认（remote 不为 true）→ **一个子进程都不起**（withRemote:false），
+     *     离线也能看到「本机是哪个版本」。`git describe` 因此也不跑，
+     *     版本号从 describe 字段为空这一点就能看出来。
+     *   · `{ remote: true }`（老师点了「和 GitHub 比一下」）→ 才 spawn ls-remote。
+     *     它只影响 `remoteChecked / remoteCommit / verdict` 三个字段，失败也有话说。
+     *
+     * ── 为什么也要报「课程工作区」的版本 ────────────────────────────────
+     * 老师发布的是**工作区里的内容**，学生 clone 的是**公开仓**。
+     * 两者不一致（工作区改了还没推）＝学生拿到的是旧内容 —— 这件事在界面上
+     * 必须能看出来。所以两个仓库各报一份，比较也在返回里直接给出结论，
+     * 不让界面自己去推。
+     */
+    async 'version.info'(args) {
+      const input = args && typeof args === 'object' ? args : {}
+      const withRemote = input.remote === true
+      const pubAbs = core.sharedAbs(PUBLIC_REPO_REL)
+      const pubState = readRepoState(pubAbs)
+      // ⚠️ 两个都要传 repoState：versionInfo 内部靠它拼 cloneCommand，
+      //    不传的话它会自己再读一次（多一次读盘，且两处可能读到不同时刻的状态）。
+      const pub = versionInfo(pubAbs, { withRemote: withRemote, repoState: pubState })
+      const ws = versionInfo(core.WORKSPACE, { withRemote: false })
+
+      // 「学生照抄这条命令，拿到的是哪个版本」—— 结论算在这里，不推给界面。
+      // 判据只用**已经查到的**事实：没查远端时只说本地事实，不假装知道学生拿到什么。
+      // 规则的实现放在 `repo.js` 的 versionVerdict()（纯函数，构建门逐条测），
+      // 这里只负责把「查没查过」这件事如实告诉它 —— 这是唯一的入参。
+      const verdict = versionVerdict(pub, withRemote && pub.remoteChecked === true)
+      // 工作区与公开仓不一致：这是**老师最该知道**的一条，因为「我明明改了」和
+      // 「学生看到的是旧内容」在这里分叉。只在两个都是仓库时才说，避免噪声。
+      // 只报「两个 SHA 不一样」这一件**可核对**的事，不去断言是哪一边旧 ——
+      // 判断谁新谁旧需要图遍历（没 fetch 过就说不准），而说错会让老师推错方向。
+      const wsDrift = (ws.hasRepo && ws.commit && pub.hasRepo && pub.commit && ws.commit !== pub.commit)
+        ? ('课程工作区的内容与公开仓工作区不是同一份（提交 ' + (ws.commitShort || '?')
+          + ' 与 ' + (pub.commitShort || '?') + '）—— 公开仓里的内容来自上一次「发布」。'
+          + '要让这条 clone 命令带上你今天改的东西，先按③发布并推送。')
+        : ''
+      return {
+        ok: true,
+        compare: withRemote,
+        public: pub, workspace: ws,
+        publicSummary: versionSummary(pub),
+        workspaceSummary: versionSummary(ws),
+        publicDir: PUBLIC_REPO_REL,
+        verdict: verdict,
+        drift: wsDrift,
       }
     },
 
@@ -1468,6 +1529,13 @@ export async function apply(ctx) {
       out.sort((a, b) => b.total - a.total)
       return { generatedAt: new Date().toISOString(), teacher: TEACHER, lessons: out, courseCode: COURSE_CODE, want: input.lesson || null }
     },
+
+    // ── 首次启动向导（内核提供，两端共用）──────────────────────────────
+    // 老师换台电脑（办公室/家里/笔记本）会撞到同一件事：这台机器还没配过工作区。
+    // 动作本体在 dsh-course-core 里；这一行是把它挂到教师端的前缀上。
+    // ⚠️ 漏了这一行的症状：发布页提示「没找到课程工作区」，而向导调的动作
+    //    返回「未知动作」—— 看起来像宿主没重启。有断言守着（verify-setup-wizard.mjs）。
+    ...core.setupHandlers,
   }
 
   core.registerApi(handlers)

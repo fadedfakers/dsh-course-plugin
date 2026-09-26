@@ -306,6 +306,13 @@ export async function apply(ctx) {
   }
 
   const handlers = {
+    // ── 首次启动向导（内核提供，两端共用）──────────────────────────────
+    // 「这台机器还没配过课程工作区」不是学生端特有的情况 —— 换台电脑就遇到。
+    // 动作本体在 dsh-course-core 里（setup.clone / setup.use / setup.info），
+    // 这里只是把它们挂到自己的 API 前缀上。
+    // ⚠️ 漏了这一行的症状：面板提示「去配工作区」，而向导调的动作返回「未知动作」——
+    //    看起来像宿主没重启，其实是这套动作压根没注册。有断言守着。
+    ...core.setupHandlers,
     async info() {
       const items = await core.listItems()
       const mine = items.filter((i) => i.student === STUDENT || i.scope === 'legacy')
