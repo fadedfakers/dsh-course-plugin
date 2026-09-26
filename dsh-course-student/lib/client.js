@@ -335,7 +335,19 @@ window.__ModuleLoader__.load({
           bdg(t.fields.lesson || '未标注', 'var(--dsw-alias-bg-layer-1)'),
           bdg(t.fields.severity || '中', SEVERITY_COLOR[t.fields.severity] || 'gray'),
           bdg(t.fields.status || '', STATUS_COLOR[t.fields.status] || 'gray'),
-          t.fields.audit === 'shared' ? bdg('已公开给全班', 'var(--dsw-alias-state-success-primary)') : bdg('仅我可见', 'var(--dsw-alias-label-secondary)'),
+          // 「已公开」这一个词原来同时承担了两个相反的含义（端侧实测指出）：
+          //   学生点的是「公开给**老师**」，而徽标写的是「已公开给**全班**」；
+          //   同时「我的提问」里的计数把 audit==='shared' 也读作「已公开」，
+          //   而标题栏那个「公开 N 条」数的是**真正**公开给全班的公共池。
+          //   于是界面并排显示「已公开 1」和「公开给全班的（0）」，学生以为全班已经看到了。
+          //
+          // 三态必须分开说：
+          //   仅我可见        → 老师看不到
+          //   已提交给老师    → audit='shared'，等老师审；这时候全班还看不到
+          //   老师已公开给全班 → 进了公共池（列表里以「公共」数据出现，不在这条上标）
+          t.fields.audit === 'shared'
+            ? bdg('已提交给老师', 'var(--dsw-alias-state-warn-primary)')
+            : bdg('仅我可见', 'var(--dsw-alias-label-secondary)'),
           teacherTurns.length ? bdg('教师已答复', 'var(--dsw-alias-brand-primary)') : null,
           t.fields.tokens ? h('span', { className: 'k57' }, 'tokens ' + t.fields.tokens) : null),
         t.fields.summary ? h('div', { className: 'k58' }, '总结：' + t.fields.summary) : null,
@@ -447,9 +459,9 @@ window.__ModuleLoader__.load({
               h('div', { className: 'k64', style: { margin: 0 } }, it.title)),
             h('button', {
               className: 'k42' + (shared ? ' kbf' : ''), style: { flex: '0 0 auto', padding: '2px 8px' },
-              title: shared ? '撤回：老师不再看到这一条' : '公开：让老师看到这一条（批改自动生成的问题默认不公开）',
+              title: shared ? '撤回：老师不再看到这一条' : '提交给老师：让他看到这一条（批改自动生成的问题默认不公开）',
               onClick: (e) => { e.stopPropagation(); onShare(it.path, !shared) },
-            }, shared ? '已公开' : '公开给老师')),
+            }, shared ? '已提交给老师' : '提交给老师')),
           h('div', { className: 'k70' },
             bdg(it.lesson || '未标注', 'var(--dsw-alias-bg-layer-1)'),
             bdg(it.severity || '中', SEVERITY_COLOR[it.severity] || 'gray'),
@@ -461,8 +473,8 @@ window.__ModuleLoader__.load({
       const pickedPaths = Object.keys(st.selItems || {})
       return h('div', { className: 'k67' },
         h('div', { className: 'k57', style: { padding: '0 4px 6px', lineHeight: '1.7' } },
-          '批改会一次判出十几条问题，它们默认**不公开**、只留在你这里。哪些值得问老师，由你自己公开。'),
-        h('div', { className: 'k64' }, '我的提问（' + mine.length + ' · 已公开 ' + sharedCount + '）'),
+          '批改会一次判出十几条问题，它们默认**不公开**、只留在你这里。哪些值得问老师，由你自己提交。'),
+        h('div', { className: 'k64' }, '我的提问（' + mine.length + ' · 已提交给老师 ' + sharedCount + '）'),
         h('div', { className: 'k20' },
           h('button', { className: 'k42', disabled: !pickedPaths.length, onClick: () => onShareBatch(pickedPaths, true) },
             '公开勾选的 ' + pickedPaths.length + ' 条'),
@@ -1639,7 +1651,7 @@ window.__ModuleLoader__.load({
       const shareItem = React.useCallback(async (path, shared) => {
         try {
           await api('item.share', { path: path, shared: shared })
-          set({ notice: shared ? '已公开给老师（他那边现在能看到这一条）' : '已撤回，老师不再看到这一条' })
+          set({ notice: shared ? '已提交给老师（他那边现在能看到这一条，全班还看不到）' : '已撤回，老师不再看到这一条' })
           await loadThreads()
         } catch (err) { set({ error: '操作失败：' + oneLineMsg(err) }) }
       }, [loadThreads])
@@ -1650,7 +1662,7 @@ window.__ModuleLoader__.load({
           const r = await api('item.share.batch', { paths: paths, shared: shared })
           set({
             busy: false, selItems: {},
-            notice: (shared ? '已公开 ' : '已撤回 ') + r.done + ' 条'
+            notice: (shared ? '已提交给老师 ' : '已撤回 ') + r.done + ' 条'
               + ((r.failed || []).length ? ('，' + r.failed.length + ' 条失败：' + r.failed[0].error) : ''),
           })
           await loadThreads()

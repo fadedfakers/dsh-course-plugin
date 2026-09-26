@@ -10,6 +10,7 @@
  *   · 作业按教案批改也调用模型
  * 因此每次调用都把 token 用量记进条目，面板里能看见自己花了多少。
  */
+import path from 'node:path'
 import { loadCore, PLUGIN_ROOT } from './core-loader.js'
 
 export const name = 'course-panel-student'
@@ -154,8 +155,10 @@ export async function apply(ctx) {
     if (!p || !core.exists(p)) throw new Error('条目不存在')
     // 只能操作自己的东西：公开是「把自己的问题交出去」，
     // 不该能改到别人（或公共面）的条目。
-    const isMine = p.indexOf('\\' + STUDENT + '\\') >= 0 || p.indexOf(MY_DIR) === 0
-    if (!isMine) throw new Error('只能公开你自己的提问（这条不属于 ' + STUDENT + '）')
+    // 判据统一走 ownPathScope —— 原来的 `indexOf('\\' + STUDENT + '\\')` 有两个毛病：
+    // 学号互为前缀时会误判（`S001` 命中 `S0011\`），而且对公共面的条目也可能放行。
+    const mineScope = ownPathScope(p, core, STUDENT)
+    if (mineScope !== 'mine') throw new Error('只能公开你自己的提问（这条不属于 ' + STUDENT + '）')
     const want = input.shared === true
     const it = core.readItem(p)
     it.fields.audit = want ? 'shared' : 'not_shared'
@@ -529,14 +532,17 @@ export async function apply(ctx) {
     async thread(args) {
       const p = args && typeof args.path === 'string' ? args.path : ''
       if (!p || !core.exists(p)) throw new Error('条目不存在：' + p)
-      // 学生只能读自己的和已公开的，别的同学的私有条目不给读
-      const scope = p.indexOf(core.PUBLIC_ITEMS_REL) === 0 ? 'public'
-        : (p.indexOf(core.STUDENT_ITEMS_REL) === 0 ? 'student' : 'legacy')
-      if (scope === 'student' && p.indexOf('\\' + STUDENT + '\\') < 0) throw new Error('这条提问不属于你')
+      // 学生只能读自己的和已公开的，别的同学的私有条目不给读。
+      // 判据统一走 ownPathScope（原来的字符串比较会把 `S001` 当成 `S0011\` 的前缀）。
+      const scope = ownPathScope(p, core, STUDENT)
+      if (scope === 'other-student' || scope === 'outside') throw new Error('这条提问不属于你')
       const it = core.readItem(p)
       const turns = it.turns
       const teacherTurns = turns.filter((x) => x.by === 'teacher').length
-      return { path: p, fields: it.fields, body: it.body, turns, scope, teacherTurns, hasTeacherAnswer: teacherTurns > 0 }
+      // 对客户端仍报 'public' / 'student' / 'legacy' 三值（历史约定），
+      // 但归属判定本身用的是 ownPathScope 的细粒度结果。
+      const scopeOut = scope === 'mine' ? 'student' : scope
+      return { path: p, fields: it.fields, body: it.body, turns, scope: scopeOut, teacherTurns, hasTeacherAnswer: teacherTurns > 0 }
     },
 
     /**
@@ -653,10 +659,14 @@ export async function apply(ctx) {
       const p = typeof input.path === 'string' ? input.path : ''
       const question = oneLine(input.question)
       if (!p || !core.exists(p)) throw new Error('条目不存在')
-      if (p.indexOf('\\' + STUDENT + '\\') < 0 && p.indexOf(core.STUDENT_ITEMS_REL) !== 0) {
-        // 允许对自己目录下的条目追问；公开的别人条目不给追加
-        if (core.exists(p) && p.indexOf(core.PUBLIC_ITEMS_REL) === 0) throw new Error('这是已公开的提问，不能改动；请新建你自己的提问')
-      }
+      // 只能追问**自己**的条目。
+      //
+      // 原来的写法是「不在自己目录里、也不是学生池开头」才进守卫，且守卫里只拦公开条目 ——
+      // 对自己目录那段恒为假，于是**整个守卫是死代码**，任何本机进程都能给
+      // 已公开条目或别人学号目录下的条目追加内容。见 ownPathScope 的注释。
+      const scope0 = ownPathScope(p, core, STUDENT)
+      if (scope0 === 'public') throw new Error('这是已公开的提问，不能改动；请新建你自己的提问')
+      if (scope0 === 'other-student') throw new Error('这条提问不属于你')
       if (!question) throw new Error('缺少追问内容')
 
       const it = core.readItem(p)
@@ -1100,6 +1110,60 @@ export async function apply(ctx) {
 }
 
 export default { name, inject, apply }
+
+/**
+ * 一条条目的路径**归谁** —— 全端唯一的判定。
+ *
+ * 为什么要收成一个函数（端侧实测 + 静态审查共同发现的）：
+ *   原来三处各写各的字符串比较，口径互不一致，而且**都有真漏洞**：
+ *
+ *   | 位置 | 原来的判据 | 问题 |
+ *   | --- | --- | --- |
+ *   | `isMine`（提问列表） | `p.indexOf('\\' + STUDENT + '\\') >= 0` | `S001` 会命中 `S0011\` —— 别人的条目被算成自己的 |
+ *   | `thread` | `p.indexOf('\\' + STUDENT + '\\') < 0` | 同上；`path` 里的 `..` 也没拦 |
+ *   | `followup` | `p.indexOf(STUDENT_ITEMS_REL) !== 0` 才进守卫 | **对自己目录永远为假 → 整个守卫是死代码**，任何本机进程都能给已公开条目追加内容 |
+ *
+ * 现在一律走「解析成绝对路径 → `path.relative` 看是否逃出根目录」，
+ * 与 `core` 里 `serveFileUnder` 已经写对的那套一致（注释里明确写了
+ * `startsWith` 会把 `C:\a\bc` 当成 `C:\a\b` 的子路径，所以不能用前缀比较）。
+ *
+ * ⚠️ `课程问题池\公共` 在 `课程问题池\学生` 的**兄弟**位置，但两者都以
+ *    `课程问题池\` 开头 —— 判断顺序必须是**先公共、后学生**，否则公开条目会被判成自己的。
+ *
+ * @param {string} p 条目相对路径（来自客户端）
+ * @param {{abs:Function, PUBLIC_ITEMS_REL:string, STUDENT_ITEMS_REL:string}} core
+ * @param {string} student 当前学生标识
+ * @returns {'public'|'mine'|'other-student'|'legacy'|'outside'}
+ */
+export function ownPathScope(p, core, student) {
+  if (typeof p !== 'string' || !p) return 'outside'
+  // ⚠️ **先拦 `..`**，再论归属。
+  //
+  // 为什么必须先拦：`path.join` 会把 `..` 吃掉，于是
+  //     `课程问题池\学生\..\..\..\Windows\win.ini`
+  // 解析后落到工作区**外面**，而它仍然以「课程问题池\」开头 —— 归属判断会继续往下走，
+  // 最后掉进 `legacy` 分支，而 `legacy` 在 `thread` / `followup` 里是**放行**的。
+  // 实测就是这么漏的（写这条用例时断言只写了「不是 mine」，太松，没抓住）。
+  //
+  // 判据：把 `\` 归一成 `/` 后，任何一段是 `..` 就拒绝。这样也顺带挡住 URL 编码
+  // （`..%2f`）在解码后变成 `../` 的形态。
+  if (String(p).replace(/\\/g, '/').split('/').indexOf('..') >= 0) return 'outside'
+  // 解析后仍必须落在工作区里；`..` 之外再兜一层（防符号链接之类的意外）
+  const full = path.resolve(core.abs(p))
+  const under = (rel) => {
+    const root = path.resolve(core.abs(rel))
+    const r = path.relative(root, full)
+    // '' = 就是根本身；不以 .. 开头且不是绝对路径 = 在根目录内
+    return r === '' || (!r.startsWith('..') && !path.isAbsolute(r))
+  }
+  if (p === core.PUBLIC_ITEMS_REL || under(core.PUBLIC_ITEMS_REL)) return 'public'
+  if (under(core.STUDENT_ITEMS_REL)) {
+    const mine = path.resolve(core.abs(core.STUDENT_ITEMS_REL + '\\' + student))
+    const r = path.relative(mine, full)
+    return (r === '' || (!r.startsWith('..') && !path.isAbsolute(r))) ? 'mine' : 'other-student'
+  }
+  return 'legacy'
+}
 
 /**
  * 把一次失败的 `git pull` 归类成「学生能照做」的提示。**必须放在模块级**：
