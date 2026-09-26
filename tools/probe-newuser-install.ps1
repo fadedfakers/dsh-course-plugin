@@ -107,11 +107,11 @@ $packages = @('dsh-course-core', 'dsh-course-student', 'dsh-course-teacher')
 $refPart = ''
 if ($Ref) { $refPart = "#$Ref" }
 
-# 记下每步退出码：用来区分「产品问题」和「网络问题」——
+# 记下每步退出码：用来区分「产品问题」和「连通问题」——
 # 这两种失败的**表面现象一模一样**（都只是 exit=1），但处置完全不同。
-# 实测踩过：沙箱到 github.com 的出口是**间歇性**的，同一条命令
-# 前一分钟成功、后一分钟 `curl 28 Could not connect`，而脚本只报「演练失败」，
-# 白白让人以为插件装不上。所以这里把错误文本也分层判出来。
+# 实测踩过：连 github.com 失败时脚本只报「演练失败」，白白让人以为插件装不上。
+# ⚠️ 而且这类失败最常见的根因**不是网络**，是 git 的 http(s).proxy 指向了一个
+#    没在监听的端口（代理软件没开）。所以下面的提示先让人查代理，而不是无脑重试。
 $codes = @()
 
 Write-Host "== 新用户安装演练 =="
@@ -248,11 +248,18 @@ if ($allOk) {
   Write-Host '演练通过：三个包都装好并且都进栈了 ✓'
 } elseif ($netFailed) {
   # 这一支必须和「产品失败」分开报，否则会把人引向错误的方向。
-  Write-Host '⚠ 演练没跑成，但**不是产品问题**：连不上 github.com（网络/出口问题）。'
+  Write-Host '⚠ 演练没跑成，但**不是产品问题**：git 连不上 github.com。'
   Write-Host '  证据：日志里出现 Could not connect to server / ERR_PNPM_GIT_RESOLVE_FAILED。'
-  Write-Host '  这类失败在一台机器上是**间歇性**的 —— 同一条命令等一会儿重跑往往就过。'
-  Write-Host "  先确认：git ls-remote https://github.com/$slug.git HEAD"
-  Write-Host '  能返回 SHA 说明网络已恢复，重跑本脚本即可。'
+  Write-Host ''
+  Write-Host '  先查这个（最常见的原因，而且不是网络本身）：git 的代理配到了死端口。'
+  Write-Host '    git config --get http.proxy                        # 有没有配代理'
+  Write-Host '    Get-NetTCPConnection -LocalPort 7890 -State Listen  # 端口有人在听吗'
+  Write-Host '  配了代理但端口没监听（代理软件没开）→ git 就卡在 TLS 握手，'
+  Write-Host '  而 Node/浏览器不走这个配置所以它们是好的（这个反差最容易误判成"网络时好时坏"）。'
+  Write-Host '  修法：git config --global --unset http.proxy; git config --global --unset https.proxy'
+  Write-Host '        （或把代理软件启动起来；临时绕过：git -c http.proxy= -c https.proxy= <命令>）'
+  Write-Host ''
+  Write-Host "  确认连通：git ls-remote https://github.com/$slug.git HEAD 能返回 SHA 就说明好了。"
 } else {
   Write-Host '演练失败：有包没进 bundles —— 这才是产品问题（用户会遇到「装了但面板不出现」）✗'
 }
