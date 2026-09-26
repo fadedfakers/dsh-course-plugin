@@ -609,7 +609,18 @@ export async function apply(ctx) {
         '原始提问': origin + '\n\n' + question + formatEvidence(ev.list),
         'AI 答复': answer,
       }
-      const rel = await createItem(fields, sections, [])
+      // 首答也落一条 thread 记录。
+      //
+      // 踩过的坑（端侧实测）：原来传的是空数组 `createItem(fields, sections, [])`，
+      // 而 core.writeItem 的契约是 `if (turns && turns.length) writeThread(...)` ——
+      // 于是**首答永远不写 .thread.json**。而列表里的轮次数的是 thread 文件里的轮数
+      // （`core.readThread(threadPathFor(...))`），所以「我的提问」每条首答都显示 **0 轮**，
+      // 详情页却能看到完整问答 —— 同一条数据两处不一致，看起来像账目坏了。
+      //
+      // 形状必须和 followup 里 push 的一致（{ q, a, at }），否则详情页把两者
+      // 混在一起渲染时会缺字段。
+      const firstTurn = { q: question, a: answer, at: new Date().toISOString() }
+      const rel = await createItem(fields, sections, [firstTurn])
       const warn = counts.droppedImages
         ? ('本次共 ' + (counts.images + counts.droppedImages) + ' 张截图，只随消息带了前 ' + counts.images + ' 张（其余仍留在条目里可回看）')
         : ''

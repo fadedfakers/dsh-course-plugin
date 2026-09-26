@@ -1475,6 +1475,13 @@ export function createCore(ctx, opts) {
                   : 'application/octet-stream'))))))))
 
   function serveFileUnder(rootRel, urlPrefix, req, res, opts) {
+    // 提交附件与提问截图里是**学生的私有数据**（作业、截图）。
+    // 跨站请求一律拒 —— 否则任意网页都能把这些图读走（见 isSameOrigin 的注释）。
+    if (!isSameOrigin(req)) {
+      res.statusCode = 403
+      res.end('forbidden: cross-site')
+      return
+    }
     let nm = ''
     try {
       let rel = String(req.url || '')
@@ -1513,6 +1520,45 @@ export function createCore(ctx, opts) {
     reg({ kind: 'prefix', path: P.shot, handler: (req, res) => serveFileUnder(STUDENT_ITEMS_REL, P.shot, req, res) })
   }
 
+  /**
+   * 只接受**同源**的请求。
+   *
+   * ── 为什么不是「随机令牌」────────────────────────────────────────────────
+   * 端侧报告建议给 `cip-stu-api` 加一个启动时生成、注入页面的 `X-CIP-Token`。
+   * 想清楚之后没这么做，理由：**任何本机进程都能 `GET /cip-stu-token` 把令牌读走**，
+   * 所以令牌挡不住"本机任意程序" —— 而报告里那条威胁恰恰是本机。
+   * 与其加一道自己会误以为有效的关卡，不如挡住**真正挡得住的那一半**。
+   *
+   * ── 这里挡住的是哪一半 ───────────────────────────────────────────────────
+   * 浏览器发起跨站请求时，会**自动带上**且页面 JS **无法伪造**的两个头：
+   *     Origin: http://evil.example
+   *     Sec-Fetch-Site: cross-site
+   * 于是「学生在浏览器里打开某个网页、那个网页偷偷打本机 API 烧他的额度 /
+   * 读他的提问」这条路被堵死。这正是报告里最现实的那条攻击路径。
+   *
+   * 非浏览器进程（本机脚本 / 别的工具）仍可伪造这两个头 —— 那类进程本来就能
+   * 直接读磁盘上的提问文件，所以不是这段代码能解决的边界，也不假装能解决。
+   *
+   * ── 判据顺序（重要）──────────────────────────────────────────────────────
+   *   1. 有 `Sec-Fetch-Site` 且不是 same-origin / none → 拒（现代浏览器的权威判据）
+   *   2. 有 `Origin` 且与 Host 不同源 → 拒（老浏览器兜底）
+   *   3. 两个都没有 → **放行**（curl / 本地脚本 / 诊断工具；它们不带这两个头）
+   */
+  function isSameOrigin(req) {
+    const h = (req && req.headers) || {}
+    const sfs = String(h['sec-fetch-site'] || '').toLowerCase()
+    if (sfs) return sfs === 'same-origin' || sfs === 'none'
+    const origin = String(h.origin || '')
+    if (!origin) return true
+    try {
+      const o = new URL(origin)
+      const host = String(h.host || '').toLowerCase()
+      return !host || o.host.toLowerCase() === host
+    } catch (e) {
+      return false // Origin 存在但解析不出来：宁可拒
+    }
+  }
+
   function registerApi(handlers) {    const readBody = (req) => new Promise((resolve) => {
       const chunks = []; let n = 0
       req.on('data', (c) => { n += c.length; if (n > 16 * 1024 * 1024) { req.destroy(); return } chunks.push(c) })
@@ -1520,6 +1566,15 @@ export function createCore(ctx, opts) {
       req.on('error', () => resolve({}))
     })
     reg({ kind: 'prefix', path: P.api, handler: async (req, res) => {
+      // 跨站请求在**最前面**拒掉：连动作名都不解析，避免任何副作用。
+      // 这一步挡的是「学生在浏览器里打开某个网页、那个网页偷打本机 API」
+      // （见 isSameOrigin 的注释：非浏览器进程本来就能读磁盘，不在这道防线的范围内）。
+      if (!isSameOrigin(req)) {
+        res.statusCode = 403
+        res.setHeader('Content-Type', 'application/json; charset=utf-8')
+        res.end(JSON.stringify({ error: '拒绝跨站请求（本面板只服务同源页面）' }))
+        return
+      }
       let action = ''
       try {
         let rel = String(req.url || '')
