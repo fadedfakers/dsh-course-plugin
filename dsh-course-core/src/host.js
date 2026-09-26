@@ -34,6 +34,8 @@ import { cached, statOf, sameStat, clearCache, cacheInfo, cacheDir } from './cac
 // L1「可配置」：这门课的形状（章节名/目录名/词表/教案骨架）从课程配置解析，
 // 读不到就用内置默认值 —— 默认值就是这门课原来的形状。
 import { resolveLayout, layoutReport } from './layout.js'
+// 版本控制信息：这套面板与课程内容是哪个版本发出去的（老师要据此给学生一条克隆命令）
+import { versionInfo, versionSummary } from './version.js'
 
 // ── 工作区解析 ────────────────────────────────────────────────
 const DEFAULT_WORKSPACE = 'C:\\Users\\Administrator\\Desktop\\暑期课程'
@@ -1765,8 +1767,20 @@ export function createCore(ctx, opts) {
     // 路由
     registerApi, registerStatic, registerMedia, registerSubmissions, mount, routes, readBodyForTest: null,
     // 诊断
-    info: () => ({
-      workspace: WORKSPACE, workspaceHow: WS.how, workspaceTried: WS.tried,
+    info: () => {
+      // 版本信息：**这套面板与课程内容是哪个版本**。
+      // 为什么放进 info() 而不只放在教师端发布页：
+      //   ① 学生端也要能显示「你 clone 到的是哪个版本」——拿错版本的症状是
+      //      「面板某些功能报未知动作」，而学生根本无从判断；
+      //   ② 老师要从这里抄一条命令给学生（命令里含远端地址）。
+      //
+      // withRemote:false —— info() 是高频调用（客户端顶栏会拉），
+      // 不该每次都 spawn git 去连远端；真要比对走 repo.status。
+      // 而且**只算一次**：versionInfo 内部会 spawn `git describe`，
+      // 在这里写两遍就是两次子进程。
+      const vi = versionInfo(WORKSPACE, { withRemote: false })
+      return {
+        workspace: WORKSPACE, workspaceHow: WS.how, workspaceTried: WS.tried,
       // 两个字段判的不是一回事，都要留着：
       //   workspaceResolved     = 解析链**有没有一个候选通过校验**（配置层面）
       //   workspaceLooksValid   = 解析出来的目录**里有没有「课程中心」**（数据层面）
@@ -1804,6 +1818,9 @@ export function createCore(ctx, opts) {
       // 完整布局 + 自检：老师换课时第一件要看的「它现在按哪套形状在认我的文件」
       layout: LAYOUT,
       layoutReport: layoutReport(LAYOUT),
+      // 版本（见上面 vi 的注释：只算一次）
+      version: vi,
+      versionSummary: versionSummary(vi),
       publicDir: PUBLIC_ITEMS_REL, studentDir: STUDENT_ITEMS_REL, submitDir: SUBMIT_ROOT_REL,
       maxSubBytes: MAX_SUB_BYTES, allowedExt: ALLOWED_EXT, maxTurns: MAX_THREAD_TURNS,
       submitExt: SUBMIT_EXT, maxBlobBytes: MAX_BLOB_BYTES, maxSubmitFiles: MAX_SUBMIT_FILES,
@@ -1812,7 +1829,8 @@ export function createCore(ctx, opts) {
       // 写死就会让教师端去请求学生端的路由（这个坑在客户端那侧已经踩过一次）。
       prefixes: { api: P.api, media: P.media, katex: P.katex, css: P.css, sub: P.sub, shot: P.shot },
       routes: routes.map((r) => r.path),
-    }),
+    }
+    },
     warn() {
       // 没解析到工作区时先说这一条（渲染与文案都在 reportUnresolvedWorkspace 里，
       // 那个函数有独立用例覆盖，见 tools/verify-workspace-warning.mjs）。

@@ -84,6 +84,10 @@ export async function apply(ctx) {
     // 它唯一的去处是「显示给老师自己敲」的那条命令。readRepoState() 的返回已经脱敏，
     // 界面拿到的 remote 永远不含凭据（这条踩过两次，见 repo.js 里的注释）。
     repoSlug, readRepoState, repoSummary, manualSteps, remoteUrl,
+    // 版本控制信息（老师要据此给学生一条克隆命令）。放在这一组里，
+    // 因为它同样只读仓库事实、不碰 token —— versionInfo 复用了 readRepoState
+    // 已经脱敏过的 remoteSafe。
+    versionInfo, versionSummary,
     // 起子进程并**收回输出**。必须用它，不能用带 encoding 的 spawnSync ——
     // 沙箱不给管道，那种写法一律 EPERM 且不抛异常（详见 core/src/run.js）。
     runCaptured, runOutput, runExitCode,
@@ -528,6 +532,16 @@ export async function apply(ctx) {
         // 原始字段留着给界面判断该亮哪个按钮；summary 是给人看的那一句
         publicRepo: Object.assign({}, publicRepo, { summary: repoSummary(publicRepo) }),
         privateRepo: Object.assign({}, privateRepo, { summary: repoSummary(privateRepo) }),
+        // ── 版本控制信息：**暂不接入本动作**（下一步做版本卡时再接）─────────
+        //
+        // 试过在这里直接给 publicVersion / workVersion，结果把发布页的**只读真机验收
+        // 打红了**：那个验收假定 repo.status 是「只读文件」的路径，而 versionInfo
+        // 默认会 spawn `git ls-remote` 去比对远端 —— 它把一个纯读盘的动作
+        // 拖成了网络依赖（连不上时整块状态就空了）。
+        //
+        // 结论：版本信息照样要在发布页显示（老师要据此给学生克隆命令），
+        // 但**必须在界面上独立成一块**、并且由界面决定何时去取，
+        // 而不是塞进 repo.status 这个高频的只读动作里。见交接文档「四之十九」。
         slug, courseName: course.title || '', courseCode: course.code || '',
         // 发布清单：没有它发布工具会生成一份，但老师得先知道「现在还没有」
         manifestReady: fsMod.existsSync(core.sharedAbs(PUBLISH_MANIFEST_REL)),
