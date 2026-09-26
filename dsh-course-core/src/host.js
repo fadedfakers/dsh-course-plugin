@@ -899,16 +899,46 @@ export function createCore(ctx, opts) {
     cache.index = data; cache.indexAt = Date.now()
     return data
   }
-  function buildTree(idx) {
+  /**
+   * 课程树。
+   *
+   * ⚠️ `hasPlan` / `planPath` **必须**和 `lesson.open` 走同一套解析（`planPathFor`）。
+   *
+   * 踩过的坑（端侧实测，学生机器上真实复现）：这里原来自己拼一条教师机路径 ——
+   *     hasPlan: !!(l.plan && fs.existsSync(abs(m.dir + '\\' + m.planDir + '\\' + l.plan)))
+   * 而公开仓里教案是**平铺**在 `教案/<模块>/` 下的，学生机上没有 `<模块>\\详细教案\\`
+   * 这个目录 → 30 个课时全部 `hasPlan=false`。
+   * 可 `lesson.open` 走的是 `planPathFor()`，它有三条兜底（课程.json / 模块目录 / 平铺目录），
+   * 所以**同一份教案，一个页面说有、另一个页面说没有** ——
+   * 鱼骨图整张在喊「这里没教案」，而那 6 份教案其实都在。
+   *
+   * 所以这里改成逐课时问 `planPathFor()`，不再另写一套路径拼接。
+   * 之前把 `buildTree` 写成同步的没有理由 —— `getTree` 本来就是 async。
+   */
+  async function buildTree(idx) {
     if (!idx) return null
-    const mods = (idx.modules || []).map((m) => ({
-      name: m.name, theme: m.theme || '', range: m.range || '', dir: m.dir || '', planDir: m.planDir || '',
-      lessons: (m.lessons || []).map((l) => Object.assign({}, l, {
-        // 索引里 lesson.plan 就是文件名；有值且磁盘上在，才算这份教案真的存在
-        hasPlan: !!(l.plan && fs.existsSync(abs(m.dir + '\\' + m.planDir + '\\' + l.plan))),
-        planPath: l.plan ? (m.dir + '\\' + m.planDir + '\\' + l.plan) : '',
-      })),
-    }))
+    // 「已发布」以 课程.json 为准（它才是老师发布动作的产物）。
+    // 读不到时退回「有教案即已发布」—— 教师机就是这种情形（本地直接有教案文件，
+    // 但没有 课程.json，因为那是发布工具生成的）。两条路都给一个明确布尔值，
+    // 绝不能再让客户端拿 undefined 去判断。
+    const pub = publishedFromCourseJson()
+    const mods = []
+    for (const m of idx.modules || []) {
+      const lessons = []
+      for (const l of m.lessons || []) {
+        const rel = await planPathFor(l.no)
+        lessons.push(Object.assign({}, l, {
+          hasPlan: !!rel,
+          planPath: rel,
+          published: pub.fromJson ? pub.nos.has(Number(l.no)) : !!rel,
+        }))
+      }
+      mods.push({
+        name: m.name, theme: m.theme || '', range: m.range || '',
+        dir: m.dir || '', planDir: m.planDir || '',
+        lessons,
+      })
+    }
     return { course: idx.course, totalLessons: idx.totalLessons, modules: mods, gradingDimensions: idx.gradingDimensions || [] }
   }
   /**
@@ -930,17 +960,26 @@ export function createCore(ctx, opts) {
   }
 
   /**
-   * 课程树的指纹：索引文件本身 + 每个模块的教案目录。
+   * 课程树的指纹：索引文件本身 + 每个模块的教案目录 + **平铺的 `教案/` 目录**。
    *
    * 为什么要带目录 mtime：`hasPlan` 取决于**教案文件在不在**，
    * 而新增一份教案**不会**改索引文件。只盯索引的话，老师刚写完教案，
    * 面板还会说「教案未撰写」——那正是最需要它说对的时候。
+   *
+   * 为什么还要加 `教案/`：`hasPlan` 现在走 `planPathFor()`，而它有**第三条兜底** ——
+   * 公开仓里教案平铺在 `教案/<模块>/` 下。学生机上模块级教案目录**根本不存在**，
+   * 只盯它们的话指纹就只剩索引那一项，于是「老师新发布了教案、学生拉取更新后
+   * 树还是旧的」——`hasPlan` 永远不刷新。同理见 buildTree 的注释。
    */
   function treeStamp(idx) {
     const parts = [statOf(abs(INDEX_REL))]
     for (const m of (idx && idx.modules) || []) {
       if (m.dir && m.planDir) parts.push(statOf(abs(m.dir + '\\' + m.planDir)))
     }
+    // 平铺目录（公开仓形态）也要进指纹，否则它的变化推不动树
+    parts.push(statOf(abs('教案')))
+    // 课程.json 决定 published（老师重新发布会改它，而教案文件本身没变）
+    for (const rel of ['课程.json', '课程中心\\课程.json']) parts.push(statOf(abs(rel)))
     const ok = parts.filter(Boolean)
     if (!ok.length) return null
     // 把多个指纹合成一个：任一项变化都会改变这一串
@@ -1022,6 +1061,38 @@ export function createCore(ctx, opts) {
   }
 
   // ── 教案与材料 ──
+  /**
+   * 公开仓的课程清单：`课程.json` 里**逐课时**的发布记录。
+   *
+   * 为什么单独抽出来：`课程.json` 是「老师发布了什么」的**权威来源** ——
+   * 它里面出现过的课时号才算已发布。面板的「已发布 N」必须照它算。
+   *
+   * 踩过的坑（端侧实测）：树的每个课时原来**没有 published 字段**，
+   * 而客户端写的是 `lessons.filter(l => l.published !== false).length` ——
+   * `undefined !== false` 恒为真，于是 **30 个课时全被算成「已发布」**，
+   * 而 `课程.json` 明明写着 publishedLessons=6。
+   * 学生于是看到 24 个他根本拿不到资料的课时被标成「已发布」，
+   * 点进去发现没教案，只会怀疑是面板坏了。
+   *
+   * @returns {{nos:Set<number>, total:number, fromJson:boolean}}
+   */
+  function publishedFromCourseJson() {
+    for (const rel of ['课程.json', '课程中心\\课程.json']) {
+      if (!exists(rel)) continue
+      try {
+        const j = JSON.parse(readText(rel))
+        const nos = new Set()
+        for (const mod of j.modules || []) {
+          for (const l of mod.lessons || []) {
+            if (l && l.no !== undefined && l.no !== null && l.no !== '') nos.add(Number(l.no))
+          }
+        }
+        return { nos, total: Number(j.totalLessons) || nos.size, fromJson: true }
+      } catch (e) { /* 换下一个候选 */ }
+    }
+    return { nos: new Set(), total: 0, fromJson: false }
+  }
+
   /** 公开仓里的 课程.json 带 planPath，是学生端最可靠的「课时→教案」映射 */
   function planFromCourseJson(lessonNo) {
     for (const rel of ['课程.json', '课程中心\\课程.json']) {

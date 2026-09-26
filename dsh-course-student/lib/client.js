@@ -1029,7 +1029,20 @@ window.__ModuleLoader__.load({
       mods.forEach((m) => (m.lessons || []).forEach((l) => lessons.push(l)))
       const total = lessons.length
       const withPlan = lessons.filter((l) => l.hasPlan).length
-      const pub = lessons.filter((l) => l.published !== false).length
+      // 「已发布」= 服务端给的 published === true。
+      //
+      // 踩过的坑（端侧实测）：这里原来写的是 `l.published !== false`。
+      // 而服务端以前**根本没下发 published 字段** → `undefined !== false` 恒为真
+      // → **30 个课时全被算成「已发布」**，而 课程.json 写着 publishedLessons=6。
+      // 一个不存在的字段被当成默认放行，是这类「数字看起来对、其实全错」的典型来源。
+      //
+      // 现在两边都收敛到显式布尔：服务端一定下发 published（true/false），
+      // 这里只认 === true。万一遇上没有该字段的旧服务端（滞后刷新），
+      // 退回用 hasPlan 判断并**在数字后标注**，而不是默默把它算成已发布。
+      const stalePublished = lessons.some((l) => l.published === undefined)
+      const pub = stalePublished
+        ? lessons.filter((l) => l.hasPlan).length
+        : lessons.filter((l) => l.published === true).length
       const isTeacher = !!(st.info && st.info.role === 'teacher')
       const onPick = (ls) => onOpenLesson(ls.no)
 

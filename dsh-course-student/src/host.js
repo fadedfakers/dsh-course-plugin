@@ -512,12 +512,10 @@ export async function apply(ctx) {
       const out = runOutput(r)
       const changed = before.status === 0 && after.status === 0 && before.stdout.trim() !== after.stdout.trim()
       if (runExitCode(r) !== 0) {
-        // 本地有改动、或历史分叉时 pull 会失败。要说清楚怎么办，而不是只报 exit code。
-        return {
-          ok: false, error: '拉取失败（可能是本地有未提交的改动，或历史分叉）',
-          detail: out.slice(-1500),
-          hint: '在 ' + core.WORKSPACE + ' 里执行 git status 看看；你自己的提问与作业已被 .gitignore 忽略，通常可以直接 git checkout -- . 后重试',
-        }
+        // 按真实原因给话术，而不是一句笼统的「可能是本地有改动」。
+        // 详细的分类理由见文件末尾的 classifySyncFailure()。
+        const cls = classifySyncFailure(out)
+        return { ok: false, error: cls.error, detail: out.slice(-1500), hint: cls.hint }
       }
       void input
       return {
@@ -1102,3 +1100,68 @@ export async function apply(ctx) {
 }
 
 export default { name, inject, apply }
+
+/**
+ * 把一次失败的 `git pull` 归类成「学生能照做」的提示。**必须放在模块级**：
+ * `apply()` 建了一个很大的 handlers 对象，在里面插一个 40 行的纯函数会把它切碎。
+ *
+ * 为什么要归类（端侧实测踩到）：原来无论什么原因，返回的都是同一句
+ *     「拉取失败（可能是本地有未提交的改动，或历史分叉）」
+ * 而实测那次真实原因是**连不上 github**（`Recv failure: Connection was reset`）。
+ * 学生照提示去 `git status`，会发现工作区很干净，然后彻底卡住 —— 归因错了等于没提示。
+ *
+ * ⚠️ 更要紧的是原句 hint 建议 `git checkout -- .`。这条**有破坏性**：它会丢弃工作区改动。
+ *    而当时 `.gitignore` 正好漏了学生的提问目录，那些提问是未跟踪状态，
+ *    照这条建议操作存在**真丢数据**的风险。
+ *    凡「让用户丢弃本地内容」的建议，都必须说清会丢什么、并要求先备份。
+ *
+ * @param {string} detail git 的原始输出
+ * @returns {{error:string, hint:string}}
+ */
+export function classifySyncFailure(detail) {
+  const d = String(detail || '')
+  // 顺序有讲究：**先判「根本没连上」，再判「连上了但合不了」**。
+  // 反过来的话，`unable to access` 这类会被后面更具体的规则抢先匹配掉。
+  if (/Could not resolve host|Connection was reset|Could not connect|Connection timed out|Failed to connect|SSL|TLS|schannel|SEC_E_|proxy|unable to access/i.test(d)) {
+    return {
+      error: '拉取失败：连不上 GitHub（不是你操作错了）',
+      hint: '这台机器访问不到 github.com。常见两因：'
+        + '① git 配了代理但代理软件没开（查 `git config --get http.proxy`，再看那个端口有没有在监听）；'
+        + '② 网络本身不通。'
+        + '网络恢复后再点一次即可 —— **不需要动你的任何文件，也不要删东西**。',
+    }
+  }
+  if (/not a git repository/i.test(d)) {
+    return {
+      error: '拉取失败：工作区不是 git 仓库',
+      hint: '这个目录里没有 .git。如果你是把课程资料拷过来的、而不是 clone 的，就没有「拉取更新」这条路；重新 clone 一份即可。',
+    }
+  }
+  if (/no such remote|No remote repository specified|does not appear to be a git repository/i.test(d)) {
+    return {
+      error: '拉取失败：仓库没有配远端地址',
+      hint: '在这个工作区里执行 `git remote -v` 看看。没有 origin 的话把课程仓地址加回去：`git remote add origin <课程仓地址>`。',
+    }
+  }
+  if (/Your local changes|local changes to the following files would be overwritten|Please commit your changes|unstaged changes/i.test(d)) {
+    return {
+      error: '拉取失败：你有本地改动，会和远端新内容冲突',
+      hint: '⚠️ **不要**用 `git checkout -- .` —— 那会丢弃你的改动。先看清楚改了什么：'
+        + '在这个工作区里跑 `git status` 与 `git diff`；'
+        + '确认那些改动不需要的话，**先备份**（复制到仓库外面），再决定是否丢弃。'
+        + '你自己的提问与作业本该被 .gitignore 忽略、不出现在这个列表里；'
+        + '**如果它们出现在列表里，先别动** —— 那是忽略规则没生效，先联系老师。',
+    }
+  }
+  if (/divergent branches|have diverged|Not possible to fast-forward|non-fast-forward/i.test(d)) {
+    return {
+      error: '拉取失败：本地与远端历史分叉',
+      hint: '说明这个仓库被本地改过并提交过。把 `git status` 与 `git log --oneline -5` 的输出发给老师，**不要自行 merge 或 reset**。',
+    }
+  }
+  return {
+    error: '拉取失败（原因未能自动识别）',
+    hint: '把下面 detail 里的原文发给老师。**在做任何 git 操作前先备份**，不要按笼统建议直接丢弃改动。',
+  }
+}
+

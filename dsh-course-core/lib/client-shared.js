@@ -408,20 +408,34 @@ function OutlineFishbone({ tree, selected, onPick }) {
           const by = y0 + (up ? (L.h - GAPB - (row + 1) * CH - row * CG) : (row * (CH + CG)))
           const sel = selected === ls.no
           const label = String(ls.title || ('课时' + ls.no))
+          // 警示点只表示「**已发布**却缺教案」。
+          //
+          // 踩过的坑（端侧实测）：原来只看 `!ls.hasPlan`，而 hasPlan 当时恒为 false
+          // （本机把 tree 的判定和 lesson.open 的解析写成了两套路径，
+          // 公开仓里教案是平铺在 教案/<模块>/ 下的，学生机上模块级教案目录不存在）。
+          // 于是侧栏 30 格**每格一个橙点** —— 一个「全部命中」的警示信息量是零：
+          // 既没说清哪一课缺教案，还把整个侧栏染成了告警色。
+          // 未发布的课时不该给警示点：它本来就没有资料，那不是异常。
+          //
+          // ⚠️ 这段代码会被 tools/extract-client-core.cjs 抽进
+          //    dsh-course-core/lib/client-shared.js（那是**构建产物**，
+          //    直接改产物会在下次构建被覆盖 —— 要改就改这里）。
+          const warnNoPlan = ls.published === true && !ls.hasPlan
           svgKids.push(h('g', {
             key: 'l' + mi + '-' + li, className: 'k8y',
             'data-sel': sel ? '1' : '0', 'data-plan': ls.hasPlan ? '1' : '0',
+            'data-warn': warnNoPlan ? '1' : '0',
             onClick: () => onPick(ls, L.mod),
           },
             h('rect', { className: 'k8z', x: bx, y: by, width: CW, height: CH, rx: 6, strokeWidth: 1 }),
             h('title', null, 'L' + ls.no + ' ' + label
-              + (ls.hasPlan ? '' : '（教案未撰写）')
+              + (warnNoPlan ? '（已发布但没有教案）' : (ls.hasPlan ? '' : '（未发布）'))
               + ((ls.knowledge && ls.knowledge.length) ? ('｜' + ls.knowledge.join(' / ')) : '')),
             h('text', { className: 'k8o', x: bx + 7, y: by + CH / 2 + 3.6 }, 'L' + ls.no),
             h('text', { className: 'k8q', x: bx + 30, y: by + CH / 2 + 3.6 },
               clipText(label, CW - 36, 11)),
-            ls.hasPlan ? null : h('circle', { cx: bx + CW - 6, cy: by + 5, r: 2.6,
-              fill: 'var(--dsw-alias-state-warn-primary)' })))
+            warnNoPlan ? h('circle', { cx: bx + CW - 6, cy: by + 5, r: 2.6,
+              fill: 'var(--dsw-alias-state-warn-primary)' }) : null))
         })
       })
 
@@ -440,7 +454,7 @@ function OutlineFishbone({ tree, selected, onPick }) {
             h('span', { className: 'k8t', style: { background: 'var(--surface-2)' } }),
             h('span', { style: { width: 6, height: 6, borderRadius: 99, display: 'inline-block',
               background: 'var(--dsw-alias-state-warn-primary)' } }),
-            '教案未撰写'),
+            '已发布但缺教案'),
           h('span', { className: 'k8s' },
             h('span', { className: 'k8t', style: { background: '#2f6feb', borderColor: '#2f6feb' } }), '当前选中'),
           h('span', { style: { marginLeft: 'auto' } }, '点任意课时 → 跳到「作业批改」')))
