@@ -210,6 +210,57 @@ Say "  默认用你的系统用户名：$stu"
 Say "  想换（例如用学号），随时设环境变量 CIP_STUDENT 后重启面板。"
 Say "  它只用于把提问/作业归到你名下，不影响任何权限。"
 
+# ── 4c. 课程标识：把索引里的真实课名写进 课程配置.json ──────────────
+#
+# 为什么要有这一步（端侧实测踩到）：面板顶栏显示的是 课程配置.json 里的 title，
+# 而这份文件以前**没人写** —— 于是它要么不存在（用内置默认值），要么里面是
+# 老师当初随手填的占位名。实测那台机器上显示的是「深度学习课程」，
+# 而真实课名在 课程结构索引.json 里写得清清楚楚。
+# 学生第一眼看的就是这个课名，写错等于告诉他「你在上另一门课」。
+#
+# 只写**索引里有的事实**：课名、模块名、总课时。
+# 章的映射（"第一章 = 哪几个模块"）索引里没有 Declaration，所以**不猜** ——
+# 那需要老师补，猜错会让按章节名匹配的功能（如课件归位）认错位置。
+Step "4c   课程标识（写 课程配置.json）"
+$cfgPath = Join-Path $RepoRoot '课程配置.json'
+$idxPath = Join-Path $RepoRoot '课程中心\课程结构索引.json'
+if (Test-Path $idxPath) {
+  try {
+    $idx = Get-Content $idxPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $cfg = [ordered]@{
+      '_说明' = '课程标识。面板顶栏显示的就是这里的 title；换一门课只改这个文件，不需要改代码。'
+      '_来源' = '由 install.ps1 从 课程中心\课程结构索引.json 生成；改课名改这里，或重跑 install.ps1。'
+      'title' = [string]$idx.course
+      'code'  = ''
+      'term'  = ''
+      'goal'  = ''
+      'note'  = ''
+      'layout' = [ordered]@{
+        'modules' = @($idx.modules | ForEach-Object { [string]$_.name })
+      }
+      '_待补' = 'layout.chapters 是"章 → 模块"的映射，索引里没有这个信息，需要老师确认后手填（例如 ["模块一","模块二"] 之类）。留空则用内置默认值 第一章..三。'
+    }
+    if ($DryRun) {
+      Say "        [DryRun] 将写入：$cfgPath"
+      Say "        [DryRun]   title = $($idx.course)"
+      Say "        [DryRun]   layout.modules = $(($idx.modules | ForEach-Object { $_.name }) -join '、')"
+    } else {
+      $json = ($cfg | ConvertTo-Json -Depth 6)
+      # 明确写 UTF-8 无 BOM：这份文件会被 Node 读（JSON.parse），带 BOM 会让它解析失败。
+      # 踩过的坑：PowerShell 的 Set-Content -Encoding UTF8 在 5.1 下**会加 BOM**。
+      [System.IO.File]::WriteAllText($cfgPath, $json, (New-Object System.Text.UTF8Encoding($false)))
+      Ok "已写入 $cfgPath"
+      Say "        课名：$($idx.course)"
+      Say "        模块：$(($idx.modules | ForEach-Object { $_.name }) -join '、')"
+      Say "        （章节映射索引里没有，需要老师补；不补就用默认值）"
+    }
+  } catch {
+    Warn "读索引失败，跳过课程配置：$($_.Exception.Message)"
+  }
+} else {
+  Warn "找不到 $idxPath，跳过课程配置（面板会用内置默认值）"
+}
+
 # ── 5. 你自己的私有数据目录 ───────────────────────────────────
 Step "5/6  建好你的私有数据目录"
 $dirs = @(
