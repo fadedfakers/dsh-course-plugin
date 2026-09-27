@@ -37,6 +37,10 @@ export * from './version.js'
 // 动作部分（起 git、写文件）在 host.js 的 createCore 里（`setup.*`），
 // 因为那要用到「往哪写」「怎么跑子进程」这些运行时知识。
 export * from './setup.js'
+// 媒体的取用策略（本地优先 → 远程回退 → 落缓存）：地址校验 / 远程 URL 拼接 /
+// 缓存路径（**有路径穿越防护**）/ 类型判断 / Content-Type。
+// 真正的 fetch 与写盘在 host.js 的 registerMedia 里。
+export * from './media.js'
 // 起子进程并**收回输出**（git / 发布工具）。用它而不是 spawnSync 的 encoding：
 // 沙箱不给管道，带 encoding 的 spawnSync 一律 EPERM，而且**不抛异常** ——
 // 表现为「退出码 null + 没有输出」，看起来像 git 自己没说话。详见 run.js 顶部注释。

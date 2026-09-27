@@ -42,6 +42,9 @@ import {
   parseRepoInput, defaultTargetDir, inspectTarget, judgeTarget, WORKSPACE_MARKER,
   courseConfigFromIndex, cloneArgs, versionArgs, explainCloneOutput,
 } from './setup.js'
+// 媒体的取用策略（本地优先 → 远程回退 → 落缓存）。纯函数放这里，
+// 真正的 fetch / 写盘在 createCore 的 registerMedia 里。
+import { validateMediaBase, mediaRemoteUrl, mediaCachePath, looksLikeMedia, contentTypeOf } from './media.js'
 // 起子进程并**收回输出**（git / 发布工具）。用它而不是 spawnSync 的 encoding：
 // 沙箱不给管道，带 encoding 的 spawnSync 一律 EPERM 且不抛异常。
 import { runCaptured, runOutput, runExitCode } from './run.js'
@@ -350,6 +353,21 @@ export const COURSE_DEFAULTS = {
   term: '',
   goal: '',
   note: '',
+  /**
+   * 媒体源（课件图 / 视频 / 讲义 PDF 从哪取）。
+   *
+   * 空 = 只用本机工作区里那份（今天的行为，离线优先）。
+   * 填了 = 本机没有的媒体去这个地址取回来，并落进 `课程中心/.cache/media/`。
+   *
+   * 为什么做成配置而不是写死在插件里：课件图**不该**和课程骨架绑在同一条分发通道上
+   * （一个 13.6 MB 基本不变，一个 0.3 MB 每周改，混在一起就是「改个错别字全班重下 14 MB」）。
+   * 有了这一项，「媒体放哪」变成老师的一行配置：GitHub raw、对象存储、学校 NAS 都行，
+   * 插件与 publish 都不用改。见 src/media.js 顶部的长注释。
+   *
+   * ⚠️ 这里**只放地址**。地址要过 validateMediaBase 的三关（见 media.js）：
+   *    不带凭据、必须 http(s)、结尾斜杠归一。
+   */
+  mediaBase: '',
 }
 // 统一约定：课程配置在**各自目录的根部** ——
 //   工作区（共享内容）: <工作区>/课程配置.json
@@ -364,7 +382,6 @@ export const COURSE_CONFIG_REL = '课程配置.json'
  * 而且不报错（端到端测试抓过一次：layout 与 topics 根本没传出来）。
  */
 export const LAYOUT_PASSTHROUGH = ['layout', 'topics', 'issueTypes', 'severities', 'planSections']
-
 /**
  * 读课程配置。**按顺序**在多个目录里找 课程配置.json，先找到的字段优先。
  *
@@ -858,6 +875,32 @@ export function createCore(ctx, opts) {
   let COURSE = readCourseConfig([COURSE_DIR, WORKSPACE])
 
   /**
+   * 媒体源（见 COURSE_DEFAULTS.mediaBase 与 src/media.js）。
+   *
+   * 环境变量优先于课程配置：**同一份课程包发给不同班级时**，
+   * 老师可能想让 A 班走局域网、B 班走对象存储 —— 那用一个环境变量切换，
+   * 不必改课程包（改了课程包就要重新发布、所有学生重下）。
+   *
+   * 无效值一律**当作没配**并留一句能看懂的说明（`MEDIA_BASE_WHY`）：
+   * 一个拼错的地址如果不作声，症状是「图全都加载不出来」，
+   * 而配置看起来完全正确 —— 那是最难查的一类。
+   */
+  let MEDIA_BASE = ''
+  let MEDIA_BASE_WHY = ''
+  /** 缓存目录：取回来的媒体落在这里（下次就走本地那一档，断网也能看） */
+  const MEDIA_CACHE_REL = '课程中心\\.cache\\media'
+  const mediaCacheRootAbs = () => path.join(COURSE_DIR, MEDIA_CACHE_REL)
+  function refreshMediaBase() {
+    const raw = process.env.CIP_MEDIA_BASE || COURSE.mediaBase || ''
+    const v = validateMediaBase(raw)
+    if (!raw) { MEDIA_BASE = ''; MEDIA_BASE_WHY = ''; return }
+    if (!v.ok) { MEDIA_BASE = ''; MEDIA_BASE_WHY = '媒体源配置无效，已当没配：' + v.why; return }
+    MEDIA_BASE = v.base
+    MEDIA_BASE_WHY = process.env.CIP_MEDIA_BASE ? '来自环境变量 CIP_MEDIA_BASE' : '来自 课程配置.json 的 mediaBase'
+  }
+  refreshMediaBase()
+
+  /**
    * ── L1：把「这门课的形状」从配置里取出来 ──────────────────────────────
    *
    * 下面这几个名字与**模块级常量同名**，这是有意的：局部声明会遮蔽模块级的，
@@ -911,6 +954,16 @@ export function createCore(ctx, opts) {
     cache.tree = null
     cache.slides = null; cache.slidesAt = 0; cache.chapterCode = ''
     try { clearCache(WORKSPACE) } catch (e) { /* 磁盘快照清不掉不影响正确性 */ }
+    /**
+     * 媒体源也在这里刷新一次。
+     *
+     * `mediaBase` 是**课程配置**里的字段，而换课、走向导都会重读课程配置 ——
+     * 不刷新的话，切到另一门课后媒体还在从上一门课的地址取。
+     * 那不会报错：只是取回来一堆 404，或者更糟 —— **取到另一门课的图**。
+     * 挂在 invalidateCache 上是刻意的：那三个赋值点（换课两处、向导一处）
+     * 都已经在调它，新增字段只需挂一处。
+     */
+    try { refreshMediaBase() } catch (e) { /* 刷新失败就沿用上一次的值 */ }
     return true
   }
 
@@ -1733,7 +1786,69 @@ export function createCore(ctx, opts) {
 
   function registerMedia() {
     const mediaDirRel = MEDIA_DIR_REL
-    reg({ kind: 'prefix', path: P.media, handler: (req, res) => {
+    /**
+     * 媒体取用：**本地优先 → 远程回退 → 落缓存**（策略与纯函数见 src/media.js）。
+     *
+     * 这一段是把「媒体放在哪」从插件里解耦出去的地方。以前这里是纯本地读盘，
+     * 文件不在就 404 —— 于是「课件图要不要随仓分发」这件事被钉死在插件里：
+     * 想不随仓分发就得改插件。现在只要 课程配置.json 里填一行 mediaBase，
+     * 媒体放 GitHub raw / 对象存储 / 学校 NAS 都行，插件一行不用改。
+     *
+     * 四档的行为都是刻意的：
+     *   ① 本地有 → 直接给，**一个网络请求都不发**（离线优先，与今天完全一样）
+     *   ② 本地没有、配了 mediaBase → 取回来给客户端，并落一份缓存
+     *   ③ 缓存命中 → 走①那一档（所以**看过一次之后断网也能看**）
+     *   ④ 没有 mediaBase / 取不到 → 404 + 一句能被看懂的日志，不假装成功
+     */
+    const remoteTo = async (chapter, fileName, res) => {
+      const base = MEDIA_BASE
+      if (!base) return false
+      const url = mediaRemoteUrl(base, chapter, fileName)
+      if (!url) return false
+      let r
+      try {
+        // 超时是必须的：教室网络半死时，一个不设超时的 fetch 会让这一页永远转圈，
+        // 而界面上看起来只是「图片加载慢」—— 那种问题最难查。
+        r = await fetch(url, { signal: AbortSignal.timeout(20000) })
+      } catch (e) {
+        cache.mediaError = '取远程媒体失败（连不上）：' + oneLine(e && e.message)
+        return false
+      }
+      if (!r.ok) {
+        cache.mediaError = '取远程媒体失败：HTTP ' + r.status + '　' + url
+        return false
+      }
+      const ct = r.headers.get('content-type') || ''
+      const judged = looksLikeMedia(fileName, ct)
+      if (!judged.ok) { cache.mediaError = judged.why + '　' + url; return false }
+      let buf
+      try { buf = Buffer.from(await r.arrayBuffer()) } catch (e) {
+        cache.mediaError = '读远程媒体失败：' + oneLine(e && e.message); return false
+      }
+      // 先回给客户端，再谈缓存 —— 让用户等的是「拿到图」，
+      // 而不是「图 + 一次磁盘写」。缓存失败不影响这一次显示。
+      res.statusCode = 200
+      res.setHeader('Content-Type', contentTypeOf(fileName))
+      res.setHeader('Cache-Control', 'public, max-age=3600')
+      // 让客户端/诊断能看出「这张是从远程来的」——排查时第一眼要能分清
+      res.setHeader('X-CIP-Media', 'remote')
+      res.end(buf)
+      cache.mediaOk = true
+      cache.mediaRemoteHits = (cache.mediaRemoteHits || 0) + 1
+      cache.mediaError = ''
+      try {
+        const p = mediaCachePath(mediaCacheRootAbs(), chapter, fileName)
+        fs.mkdirSync(path.dirname(p), { recursive: true })
+        fs.writeFileSync(p, buf)
+        cache.mediaCached = (cache.mediaCached || 0) + 1
+      } catch (e) {
+        // 写不进缓存**不算失败**：这一次图已经给出来了，只是下次还要再取一遍。
+        cache.mediaError = '媒体缓存没写成：' + oneLine(e && e.message)
+      }
+      return true
+    }
+
+    reg({ kind: 'prefix', path: P.media, handler: async (req, res) => {
       let nm = ''
       try {
         let rel = String(req.url || '')
@@ -1757,6 +1872,9 @@ export function createCore(ctx, opts) {
         if (hit) { useName = hit; full = path.join(dirAbs, hit) }
         else if (VIDEO_EXT.test(useName)) {
           // 视频有意不随课程包分发：返回一张说明牌，比破图有用
+          // ⚠️ 但**配了 mediaBase 时先去远程找** —— 视频正是最该放对象存储的那一类，
+          //    否则「配了远程源、视频还是说明牌」会让老师以为配置没生效。
+          if (MEDIA_BASE && await remoteTo(segs[0], useName, res)) return
           const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="640" height="180">'
             + '<rect width="640" height="180" fill="#f4f4f5" stroke="#d4d4d8"/>'
             + '<text x="320" y="80" text-anchor="middle" font-size="17" fill="#52525b" font-family="sans-serif">此视频未随课程包分发</text>'
@@ -1767,18 +1885,33 @@ export function createCore(ctx, opts) {
           res.setHeader('Cache-Control', 'public, max-age=86400'); res.end(svg); return
         }
       }
+      // ③ 本地没有 → **先看缓存**，再看远程。
+      //
+      // ⚠️ 这一档是上面「落缓存」那一步的**兑现处**，第一版漏了它：
+      //    写进去的缓存从来没被读过 —— 于是每次翻到那一页都要重新下载一遍，
+      //    而「离线也能看」这句承诺根本没生效（症状轻到没人报：只是有点慢、
+      //    断网就坏）。是 verify-media-fallback.mjs 里那条「第二次不再发远程请求」
+      //    的断言把它抓出来的，那一条的判据是**远程请求计数为 0** ——
+      //    只断言「第二次也能拿到图」是假绿，因为走远程同样能拿到。
+      if (!fs.existsSync(full) && MEDIA_BASE) {
+        try {
+          const cached = mediaCachePath(mediaCacheRootAbs(), segs[0], useName)
+          if (fs.existsSync(cached)) { full = cached; cache.mediaCacheHits = (cache.mediaCacheHits || 0) + 1 }
+        } catch (e) { /* 段名不安全时本来就走不到这里（上面已校验），忽略 */ }
+      }
+      if (!fs.existsSync(full)) {
+        if (await remoteTo(segs[0], useName, res)) return
+        cache.mediaError = cache.mediaError || ('找不到这个媒体文件，也没有可用的远程源：' + segs[0] + '/' + segs[1])
+        res.statusCode = 404; res.end('not found'); return
+      }
       try {
         const bytes = fs.readFileSync(full)
         cache.mediaOk = true
         res.statusCode = 200
-        res.setHeader('Content-Type', /\.png$/i.test(useName) ? 'image/png'
-          : (/\.jpe?g$/i.test(useName) ? 'image/jpeg'
-            : (/\.gif$/i.test(useName) ? 'image/gif'
-              : (/\.webp$/i.test(useName) ? 'image/webp'
-                : (/\.svg$/i.test(useName) ? 'image/svg+xml'
-                  : (/\.mp4$/i.test(useName) ? 'video/mp4'
-                    : (/\.webm$/i.test(useName) ? 'video/webm' : 'application/octet-stream')))))))
+        res.setHeader('Content-Type', contentTypeOf(useName))
         res.setHeader('Cache-Control', 'public, max-age=3600')
+        // 与远程那一档用同一个头：诊断时能一眼分清「这张是本机就有的」还是「取回来的」
+        res.setHeader('X-CIP-Media', full === path.join(dirAbs, useName) ? 'local' : 'cache')
         res.end(bytes)
       } catch (error) {
         cache.mediaError = '读图失败 ' + oneLine(segs[0] + '/' + segs[1]) + '：' + oneLine(error && error.message)
@@ -1798,16 +1931,12 @@ export function createCore(ctx, opts) {
    * 不能有 ..、不能是绝对路径，且解析结果必须真的落在允许的根目录里。
    * 这是文件读取路由唯一正确的写法 —— 只查 '..' 子串是不够的
    * （Windows 上 %5C 和盘符都能绕过朴素检查）。
+   *
+   * ⚠️ 这里原来有一个**局部**的 contentTypeOf，而 registerMedia 现在从 media.js
+   *    引入了同名函数 —— 局部声明会遮蔽引入的那个，两处各自演化。
+   *    所以那段被删掉了，改用 media.js 的 contentTypeOf（含 .txt / .md），
+   *    这样「本地读到的」与「远程取回来的」永远用同一张表。
    */
-  const contentTypeOf = (nm) => (/\.png$/i.test(nm) ? 'image/png'
-    : (/\.jpe?g$/i.test(nm) ? 'image/jpeg'
-      : (/\.gif$/i.test(nm) ? 'image/gif'
-        : (/\.webp$/i.test(nm) ? 'image/webp'
-          : (/\.svg$/i.test(nm) ? 'image/svg+xml'
-            : (/\.pdf$/i.test(nm) ? 'application/pdf'
-              : (/\.txt$/i.test(nm) ? 'text/plain; charset=utf-8'
-                : (/\.md$/i.test(nm) ? 'text/markdown; charset=utf-8'
-                  : 'application/octet-stream'))))))))
 
   function serveFileUnder(rootRel, urlPrefix, req, res, opts) {
     // 提交附件与提问截图里是**学生的私有数据**（作业、截图）。
@@ -2137,6 +2266,18 @@ export function createCore(ctx, opts) {
       workspaceLooksValid: fs.existsSync(path.join(WORKSPACE, '课程中心')),
       role, label, prefix,
       mediaOk: cache.mediaOk === true, mediaError: cache.mediaError,
+      // 媒体源的三个事实：配了没有、配的是哪、为什么是这样。
+      // 界面要能回答学生的第一个问题：「这张图为什么显示不出来」——
+      // 是没配源、配错了、还是取的时候网络断了（那三个的修法完全不同）。
+      media: {
+        base: MEDIA_BASE,
+        how: MEDIA_BASE_WHY,
+        configured: !!MEDIA_BASE,
+        remoteHits: cache.mediaRemoteHits || 0,
+        cached: cache.mediaCached || 0,
+        cacheHits: cache.mediaCacheHits || 0,
+        cacheDir: MEDIA_CACHE_REL,
+      },
       katexOk: cache.katexOk, hasLlm: ctx.get('llm') !== undefined,
       chapters: CHAPTERS,
       // 当前课程：既有课程配置（课程名/课程码/目标），也有**定位信息**

@@ -235,10 +235,12 @@ if (Test-Path $idxPath) {
       'term'  = ''
       'goal'  = ''
       'note'  = ''
+      'mediaBase' = ''
       'layout' = [ordered]@{
         'modules' = @($idx.modules | ForEach-Object { [string]$_.name })
       }
       '_待补' = 'layout.chapters 是"章 → 模块"的映射，索引里没有这个信息，需要老师确认后手填（例如 ["模块一","模块二"] 之类）。留空则用内置默认值 第一章..三。'
+      '_mediaBase说明' = 'mediaBase：留空 = 只用这个仓里那份课件图（离线优先）。填了 = 本机没有的图/视频去这个地址取，并缓存到 课程中心\.cache\media\。它让"课件图不随课程包分发"成为可能（改教案不必让全班重下十几兆），也是将来放录播视频的入口。只接受 https:// 或 http:// 的裸地址，不能带账号令牌。'
     }
     if ($DryRun) {
       Say "        [DryRun] 将写入：$cfgPath"

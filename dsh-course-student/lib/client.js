@@ -2001,6 +2001,15 @@ window.__ModuleLoader__.load({
         // 而「加载失败：读课程数据失败」那条红条会把它往下挤 ——
         // 用户看到的第一个东西应该正好是「现在该做的那一件事」。
         h(SetupWizard, { info: st.info, api: api, onDone: load }),
+        // 媒体源**配了但无效**时吭一声：那是「图全都加载不出来」里最难查的一档 ——
+        // 地址拼错时取回来的是 404，界面上的表现与「这张图本来就没有」一模一样，
+        // 而配置文件看起来完全正确。正常配置下一声不吭，不占地方。
+        (st.info && st.info.media && !st.info.media.configured && st.info.media.how)
+          ? h('div', {
+            className: 'k57',
+            style: { margin: '6px 14px 0', color: 'var(--dsw-alias-state-warn-primary)' },
+          }, '⚠ ' + st.info.media.how)
+          : null,
         // 就绪清单 / 首次设置向导。
         // 原来这里只有一个「我是谁」卡片，现在扩成三件事的清单 ——
         // 「面板是空的」有四种完全不同的原因，而界面上看起来一模一样。

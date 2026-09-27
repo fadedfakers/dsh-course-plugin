@@ -182,6 +182,12 @@ export function courseConfigFromIndex(idx, extra) {
     term: '',
     goal: '',
     note: '',
+    // 媒体源：留空 = 只用课程包里那份（离线优先，今天的行为）。
+    // 填了 = 本机没有的课件图/视频去这里取，并落进 课程中心\.cache\media\。
+    // 为什么它必须出现在配置里：课件图**不该**和课程骨架挤在同一条分发通道上 ——
+    // 一个十几兆基本不变、一个几百 K 每周改，混在一起就是「改个错别字全班重下」。
+    // 将来发录播视频 / 原始 PPT 时，这一项是唯一的开关（见 core/src/media.js）。
+    mediaBase: '',
     layout: { modules },
     _待补: 'layout.chapters 是"章 → 模块"的映射，索引里没有这个信息，需要老师确认后手填。留空则用内置默认值 第一章..三。',
   }
