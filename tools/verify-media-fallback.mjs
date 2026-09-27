@@ -296,10 +296,22 @@ console.log('  假远程源：' + remoteBase)
 fs.writeFileSync(path.join(wsRoot, '课程配置.json'), JSON.stringify({
   title: '探针课程', mediaBase: remoteBase,
 }, null, 2), 'utf8')
+/**
+ * ⚠️ 隔离必须**两条都做**：`CIP_WORKSPACE` **和** `CIP_WORKSPACE_FILE`。
+ *
+ * 踩过一次真的（本轮）：这里原来只设 `CIP_WORKSPACE=临时工作区`、
+ * 然后把 `CIP_WORKSPACE_FILE` **删掉**。以前没事，是因为这台机器上
+ * `~/.dsh/cip-workspace.txt` **不存在** —— 删掉它等于没有候选。
+ * 本轮给教师机补上那个文件之后（见 diary：删掉兜底路径的代价），
+ * 解析链就**先**命中了教师机那份真工作区，而这个探针的假工作区被跳过 ——
+ * 于是 18 条断言集体变红，看起来像"媒体回退坏了"，其实是**探针没隔离干净**。
+ *
+ * 正确做法：两条都给，而且把文件条**指向一个存在的文件**（内容就是假工作区）。
+ * 这样无论宿主机器上有没有那份配置文件，探针都只看到自己那一份。
+ */
 delete process.env.CIP_WORKSPACE
 process.env.CIP_WORKSPACE_FILE = path.join(tmp, 'ws.txt')
 fs.writeFileSync(process.env.CIP_WORKSPACE_FILE, wsRoot, 'utf8')
-delete process.env.CIP_WORKSPACE_FILE
 process.env.CIP_WORKSPACE = wsRoot
 delete process.env.CIP_MEDIA_BASE
 
@@ -447,7 +459,9 @@ const get = (rel) => new Promise((resolve) => {
 console.log('\n=== ⑥ 没配 mediaBase（今天的行为）：本地优先，缺就是 404 ===')
 {
   fs.writeFileSync(path.join(wsRoot, '课程配置.json'), JSON.stringify({ title: '探针课程' }, null, 2), 'utf8')
-  delete process.env.CIP_WORKSPACE_FILE
+  // ⚠️ 这里同样**不能**删 CIP_WORKSPACE_FILE（理由见上面那段注释）：
+  //    删了就会去读宿主机器上那份真实配置，探针的假工作区不再生效。
+  delete process.env.CIP_MEDIA_BASE
   const routes2 = []
   const core2 = createCore({ get: () => undefined, effect: (fn) => fn(), webServer: { register: (r) => { routes2.push(r); return () => { } } } },
     { prefix: '/cip-mtest2', role: 'student', pkgRoot: CORE_SRC, label: '探针2' })

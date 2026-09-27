@@ -155,6 +155,20 @@ fs.writeFileSync(path.join(wsRoot, '资料.json'), JSON.stringify({
 delete process.env.CIP_WORKSPACE_FILE
 process.env.CIP_WORKSPACE = wsRoot
 delete process.env.CIP_COURSE_DIR
+/**
+ * ⚠️ 这里把 CIP_WORKSPACE_FILE **指到一个存在的文件**（内容 = 这个假工作区），
+ *    而不是删掉它。
+ *
+ * 删掉的话，解析链会去读宿主机器上的 `~/.dsh/cip-workspace.txt` ——
+ * 在有配置的机器上（教师机就是）它会**先命中真工作区**，本探针的假工作区被跳过，
+ * 于是断言集体变红，看起来像"资料功能坏了"。
+ * 同类事故在 verify-media-fallback.mjs 里真实发生过一次（见那边的注释）。
+ */
+{
+  const wsFile = path.join(tmp, 'ws.txt')
+  fs.writeFileSync(wsFile, wsRoot, 'utf8')
+  process.env.CIP_WORKSPACE_FILE = wsFile
+}
 
 const routes = []
 const core = createCore({
