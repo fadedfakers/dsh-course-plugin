@@ -468,6 +468,90 @@ console.log('\n=== ⑧c setup.clone 是后台任务（进度条要靠它）===')
     typeof core.coreHandlers['setup.use'] === 'function' && r.mode === 'existing', r.mode)
 }
 
+// ── ⑧d clone 的**成功路径**（用假 git 端到端跑，本沙箱起不了真 git）────────
+//
+// 为什么需要这一段：真 git 在本沙箱跑不了（传输栈要 spawn `sh.exe`，被拒），
+// 于是"进度条真的有进度吗""跑完真的认下工作区了吗"就没有任何断言守 ——
+// 而一条没人守的进度条，下次重构就会静默变成永远 0%，谁也说不清是
+// git 没输出还是我们没解析。这里用一个**会按真实格式吐进度的假 git**
+// （`CIP_GIT_BIN` 指过去）把整条路跑一遍。
+console.log('\n=== ⑧d clone 成功路径 + 进度（假 git 端到端）===')
+{
+  const fake = path.join(tmpRoot, 'fake-git.cmd')
+  /**
+   * ⚠️ 假 git 必须是个**能直接 spawn 的东西**：Windows 上 `.mjs` 不是可执行文件
+   * （`spawn` 会 ENOENT，而 `runCaptured` 把它记成"跑不了 git"）——
+   * 第一版就是直接指向 `.mjs`，于是任务停在"检查 git"，断言报
+   * 「这台机器上跑不了 git」，看起来像环境问题，其实是夹具不在 PATH 里。
+   * 生成一个 `.cmd` 包一层 `node <脚本>`，就与真 git 的调用方式一致了。
+   */
+  fs.writeFileSync(path.join(tmpRoot, 'fake-git-impl.mjs'), [
+    "import fs from 'node:fs'",
+    "import path from 'node:path'",
+    'const argv = process.argv.slice(2)',
+    'const sleep = (ms) => new Promise((r) => setTimeout(r, ms))',
+    "const emit = (s) => process.stderr.write(s + '\\n')",
+    "if (argv[0] === '--version') { process.stdout.write('git version 9.9.9-fake\\n'); process.exit(0) }",
+    "const target = argv[argv.length - 1]",
+    "emit(\"Cloning into '\" + target + \"'...\")",
+    'await sleep(100)',
+    "emit('remote: Enumerating objects: 2871, done.')",
+    'await sleep(100)',
+    'for (let i = 1; i <= 5; i++) {',
+    "  emit('Receiving objects: ' + String(i * 20).padStart(3) + '% (' + (i * 574) + '/2871), ' + i + '.20 MiB | 1.20 MiB/s')",
+    '  await sleep(150)',
+    '}',
+    "emit('Receiving objects: 100% (2871/2871), 13.6 MiB | 2.10 MiB/s, done.')",
+    "fs.mkdirSync(path.join(target, '课程中心'), { recursive: true })",
+    "fs.writeFileSync(path.join(target, '课程中心', '课程结构索引.json'), JSON.stringify({ course: '假 git clone 下来的课', totalLessons: 3, modules: [{ name: '模块一' }] }), 'utf8')",
+    'process.exit(0)',
+  ].join('\n'), 'utf8')
+  fs.writeFileSync(fake, '@echo off\r\n"' + process.execPath + '" "%~dp0fake-git-impl.mjs" %*\r\n', 'utf8')
+
+  const target = path.join(tmpRoot, 'from-fake-git')
+  process.env.CIP_GIT_BIN = fake
+  try {
+    const started = await core.coreHandlers['setup.clone']({ repo: 'https://github.com/o/fake-course.git', dir: target })
+    check('起任务立刻返回 jobId', !!started.jobId, String(started.jobId))
+
+    // 轮询：应当**看得到百分比往上走**，而不是从 0 直接跳 100
+    const seen = []
+    let last = started
+    let midStep = ''
+    for (let i = 0; i < 40 && !last.done; i++) {
+      await new Promise((r) => setTimeout(r, 120))
+      last = await core.coreHandlers['setup.progress']({ jobId: started.jobId })
+      if (typeof last.percent === 'number') {
+        seen.push(last.percent)
+        // ⚠️ 阶段话术要在**中间那一刻**抓，不能读最后那一帧 ——
+        //    跑完之后 step 变成了「配好了」，拿它去断言"有中文阶段名"必然失败
+        //    （第一版就是这么红的，红的是断言不是产品）。
+        if (!midStep && last.percent > 0 && last.percent < 100) midStep = last.step
+      }
+    }
+    const mid = seen.filter((p) => p > 0 && p < 100)
+    check('【进度条真的在动】轮询过程中见到过中间百分比（0<p<100）',
+      mid.length > 0, '见到的百分比：' + seen.join('%,') + '%')
+    check('  中间那一刻的阶段话术是中文（不是把 git 英文原样丢上来）',
+      /正在/.test(midStep), JSON.stringify(midStep))
+    check('  任务跑完（done）', last.done === true, last.status)
+    check('  最终是 done 且 result.ok', last.status === 'done' && !!last.result && last.result.ok === true,
+      JSON.stringify({ status: last.status, ok: last.result && last.result.ok, err: last.result && last.result.error }).slice(0, 140))
+    check('  百分比到 100', last.percent === 100, String(last.percent))
+    if (last.result && last.result.ok) {
+      check('【成功路径闭环】工作区被认下来（info 说配好了）', core.info().setup.workspaceResolved === true)
+      check('  认下的就是 clone 下来的那个目录',
+        path.resolve(core.info().workspace) === path.resolve(target), core.info().workspace)
+      check('  课名来自那个仓里的索引（不是内置占位名）',
+        core.info().course.title === '假 git clone 下来的课', core.info().course.title)
+      check('  返回里带着「跑过什么命令」（老师要能核对）',
+        (last.result.steps || []).length > 0 && /clone/.test(last.result.steps[0].cmd), (last.result.steps[0] || {}).cmd)
+    }
+  } finally {
+    delete process.env.CIP_GIT_BIN
+  }
+}
+
 // ── ⑨ 两端客户端：向导是同一份代码，而且真的挂上了 ──────────────────────
 console.log('\n=== ⑨ 两个客户端：同一份向导代码 + 真的挂进面板 ===')
 {

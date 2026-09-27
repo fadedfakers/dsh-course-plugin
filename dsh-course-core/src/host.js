@@ -274,8 +274,28 @@ export function resolveWorkspace(opts = {}) {
  *    ENOENT，报出来却是「找不到 git」，明明装了。
  *    所以先试写死的路径，再回落 PATH 里的 `git`。
  */
+/** git 可执行文件（见 gitBin 的注释：`CIP_GIT_BIN` 只给断言用） */
 export function gitBin() {
+  const override = process.env.CIP_GIT_BIN
+  if (override && fs.existsSync(override)) return override
   return fs.existsSync('D:\\Git\\cmd\\git.exe') ? 'D:\\Git\\cmd\\git.exe' : 'git'
+}
+
+/**
+ * 真正的 argv：Windows 上 **`.cmd` / `.bat` 不能被直接 spawn**，必须经 `cmd /c`。
+ *
+ * ⚠️ 这一条是**实测**出来的，不是习惯写法：本机（DSH 沙箱）里
+ *   `spawnSync('<某个>.cmd')` → `EPERM`，而 `spawnSync('cmd.exe', ['/c', '<那个>.cmd'])` → 正常。
+ * 真 git 是 `git.exe`，走不到这一支；只有断言用的假 git（一个 `.cmd` 包装）
+ * 需要它 —— 于是"clone 成功路径"才有办法在没有可用 git 传输栈的机器上被端到端验。
+ * 写成**一处**而不是在每个调用点各判一次：那种散开必然漏（漏了的症状是
+ * 「这台机器上跑不了 git」，看起来像环境问题）。
+ */
+export function gitArgv(git, args) {
+  if (/\.(cmd|bat)$/i.test(String(git))) {
+    return { cmd: process.env.ComSpec || 'cmd.exe', args: ['/c', git, ...args] }
+  }
+  return { cmd: git, args }
 }
 
 export const CHAPTERS = ['第一章', '第二章', '第三章']
@@ -1249,7 +1269,8 @@ export function createCore(ctx, opts) {
     if (!verdict.ok) return { ok: false, step: 'inspect', error: verdict.note, state }
 
     const git = gitBin()
-    const probe = runCaptured(git, versionArgs(), { timeout: 20000, hintDir: findWriteHint() })
+    const probeArgv = gitArgv(git, versionArgs())
+    const probe = runCaptured(probeArgv.cmd, probeArgv.args, { timeout: 20000, hintDir: findWriteHint() })
     if (runExitCode(probe) !== 0) {
       return {
         ok: false, step: 'git',
@@ -1259,7 +1280,8 @@ export function createCore(ctx, opts) {
     }
     fs.mkdirSync(path.dirname(target), { recursive: true })
     const args = cloneArgs(parsed.remote, target)
-    const r = runCaptured(git, args, { timeout: 600000, hintDir: findWriteHint() })
+    const cloneArgv = gitArgv(git, args)
+    const r = runCaptured(cloneArgv.cmd, cloneArgv.args, { timeout: 600000, hintDir: findWriteHint() })
     const explained = explainCloneOutput(r, parsed.name)
     const steps = [{ cmd: 'git ' + args.join(' '), code: runExitCode(r), out: runOutput(r).slice(-4000) }]
     if (!explained.ok) return { ok: false, step: 'clone', error: explained.why, steps, remote: parsed.remote, dir: target }
@@ -1423,7 +1445,8 @@ export function createCore(ctx, opts) {
     //    断言 ⑧c 抓到的（它读 result.error 的内容）。
     const git = gitBin()
     job.step = '检查 git'
-    const probe = runCaptured(git, versionArgs(), { timeout: 20000, hintDir: findWriteHint() })
+    const probeArgv = gitArgv(git, versionArgs())
+    const probe = runCaptured(probeArgv.cmd, probeArgv.args, { timeout: 20000, hintDir: findWriteHint() })
     if (runExitCode(probe) !== 0) {
       job.status = 'failed'; job.endedAt = Date.now()
       job.result = {
@@ -1448,7 +1471,8 @@ export function createCore(ctx, opts) {
       try {
         const ofd = fs.openSync(outPath, 'w')
         const efd = fs.openSync(errPath, 'w')
-        child = spawn(git, args, { stdio: ['ignore', ofd, efd], windowsHide: true })
+        const ga = gitArgv(git, args)
+        child = spawn(ga.cmd, ga.args, { stdio: ['ignore', ofd, efd], windowsHide: true })
         const timer = setInterval(() => {
           // 轮询 stderr 的最新一行 → 解析成进度。**所有异常都吞掉**：
           // 轮询失败最多是进度不动，绝不能把 clone 弄挂。
