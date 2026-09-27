@@ -282,13 +282,14 @@ const core = createCore(mkCtx({ register: () => () => { } }), {
   /**
    * 反向：动作名要与界面真正调的那些**逐个对上**。
    *
-   * ⚠️ 这一条原来写的是"就是这三个"，后来 `setupHandlers` 改名成了
-   *    `coreHandlers` —— 因为它开始装「两端都要有的内核动作」，
-   *    不再只是向导那三个（现在多了 `materials.list`，资料页的数据源）。
-   *    判据跟着改，并且**把清单写全**：漏列一个就等于少守一个动作，
-   *    而"少守的那个"正是将来会拼错的那一个。
+   * ⚠️ 这一条改过两次，每次都跟着真实设计走：
+   *   ① 最初写"就是向导那三个"，后来 `setupHandlers` 改名 `coreHandlers`
+   *      （它开始装两端都要有的内核动作），多了 `materials.list`；
+   *   ② 本轮 clone 改成了**后台任务 + 轮询**（老师要的进度条），于是多了
+   *      `setup.progress`。**清单要写全** —— 漏列一个就等于少守一个动作，
+   *      而"少守的那个"正是将来会拼错的那一个。
    */
-  const wantActions = ['materials.list', 'setup.clone', 'setup.info', 'setup.use']
+  const wantActions = ['materials.list', 'setup.clone', 'setup.info', 'setup.progress', 'setup.use']
   check('  动作名与界面调的一一对应（' + wantActions.length + ' 个）',
     JSON.stringify(Object.keys(core.coreHandlers).sort()) === JSON.stringify(wantActions),
     Object.keys(core.coreHandlers).sort().join(','))
@@ -340,10 +341,22 @@ fs.writeFileSync(path.join(fixture, '课程中心', '课程结构索引.json'),
   check('  【不猜】没有 layout.chapters', (cfg.layout || {}).chapters === undefined)
 }
 
-// ── ⑧ 端到端：clone 的失败路径（成功路径本沙箱跑不了，见文件头注释）──────
-console.log('\n=== ⑧ setup.clone：该拒的必须拒，且不许留下半个目录 ===')
+// ── ⑧ 端到端：clone 的前置判断（成功路径本沙箱跑不了，见文件头注释）──────
+/**
+ * ⚠️ 这一组走的是 **`planClone`（同步）**，不是 `setup.clone`（异步任务）。
+ *
+ * 为什么改：本轮把 clone 变成了后台任务 + 进度轮询（老师要的进度条）。
+ * 而"地址里的令牌要拒""落点非空要拒"这些判断**本身是同步的、不碰网络**，
+ * 它们应该**立刻**回答而不是拖到任务的第一帧 —— 用户点下去就该看到错误，
+ * 而不是先闪一下"准备中…"。
+ * 所以判据被抽成 `planClone()`，两条路（同步判断 / 后台任务）共用同一份。
+ * 断言测这个同步函数：**快、确定、且覆盖全部拒绝路径**。
+ *
+ * 后台任务那一侧另有一条断言（⑧c）钉住"立刻返回 jobId + 能轮询到状态"。
+ */
+console.log('\n=== ⑧ planClone：该拒的必须拒，且不许留下半个目录 ===')
 {
-  const r1 = await core.coreHandlers['setup.clone']({ repo: 'https://u:ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH@github.com/o/r.git', dir: path.join(tmpRoot, 'x1') })
+  const r1 = core.planClone({ repo: 'https://u:ghp_AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH@github.com/o/r.git', dir: path.join(tmpRoot, 'x1') })
   check('带凭据的地址 → 在解析这一步就拒（连目录都不会碰）',
     r1.ok === false && r1.step === 'parse', r1.step)
   check('  目录没有被创建', !fs.existsSync(path.join(tmpRoot, 'x1')))
@@ -352,23 +365,78 @@ console.log('\n=== ⑧ setup.clone：该拒的必须拒，且不许留下半个�
   const busy = path.join(tmpRoot, 'busy-dir')
   fs.mkdirSync(busy, { recursive: true })
   fs.writeFileSync(path.join(busy, '我的论文.docx'), 'x', 'utf8')
-  const r2 = await core.coreHandlers['setup.clone']({ repo: 'https://github.com/o/r.git', dir: busy })
+  const r2 = core.planClone({ repo: 'https://github.com/o/r.git', dir: busy })
   check('落点非空且不是仓库 → 在 inspect 这一步就拒', r2.ok === false && r2.step === 'inspect', r2.step)
   check('  那句拒绝里说清了目录里有几项', /1 项|我的论文/.test(r2.error || ''), (r2.error || '').slice(0, 140))
   check('  【绝不覆盖】那个文件还在', fs.existsSync(path.join(busy, '我的论文.docx')))
 
   // 已经是仓库的落点：不该 clone（会套一层），而是「就用它」——
-  // 但夹具不是课程仓，所以必须走「认不下来」这条路，且不许把工作区换过去
+  // planClone 会把这一档标成 useExisting（不是错误，是**换一条路**）
   const repoDir = path.join(tmpRoot, 'an-old-clone')
   fs.mkdirSync(path.join(repoDir, '.git'), { recursive: true })
-  const before = core.info().workspace
-  const r3 = await core.coreHandlers['setup.clone']({ repo: 'https://github.com/o/r.git', dir: repoDir })
-  check('落点已经是 git 仓库但不是课程仓 → 不能认成工作区', r3.ok === false, JSON.stringify(r3).slice(0, 140))
-  check('  【硬要求】工作区没有被悄悄换走', core.info().workspace === before, core.info().workspace)
+  const r3 = core.planClone({ repo: 'https://github.com/o/r.git', dir: repoDir })
+  check('落点已经是 git 仓库 → 不 clone，标成「就用它」',
+    r3.ok === false && r3.useExisting === true, JSON.stringify({ step: r3.step, use: r3.useExisting }).slice(0, 120))
+  check('  拒绝理由说清了「会套一层子目录」', /套一层/.test(r3.error || ''), (r3.error || '').slice(0, 110))
 
   // 空仓库地址：parse 就拒，不猜
-  const r4 = await core.coreHandlers['setup.clone']({ repo: '', dir: path.join(tmpRoot, 'x4') })
+  const r4 = core.planClone({ repo: '', dir: path.join(tmpRoot, 'x4') })
   check('地址为空 → parse 拒', r4.ok === false && r4.step === 'parse')
+
+  // 一切正常时：给出解析结果 + 落点 + 现状（供任务继续跑）
+  const okDir = path.join(tmpRoot, 'fresh-target')
+  const r5 = core.planClone({ repo: 'https://github.com/o/r.git', dir: okDir })
+  check('干净的落点 → planClone 通过，并给出 remote / target',
+    r5.ok === true && r5.parsed.remote === 'https://github.com/o/r.git' && path.resolve(r5.target) === path.resolve(okDir),
+    JSON.stringify({ remote: r5.ok ? r5.parsed.remote : '', target: r5.target }))
+  check('  【不该有副作用】planClone 不创建目录', !fs.existsSync(okDir))
+}
+
+// ── ⑧c clone 变成了后台任务：立刻返回 jobId，而且进度能轮询到 ─────────────
+console.log('\n=== ⑧c setup.clone 是后台任务（进度条要靠它）===')
+{
+  /**
+   * 为什么这一条必须存在：clone 一个课程仓要几十秒到几分钟，
+   * 而界面在此之前只能说一句"处理中…"（老师提的「加一个进度条可视化」）。
+   * 判据分三层：
+   *   ① 动作**立刻**返回（不等 clone 跑完）—— 否则进度条没意义
+   *   ② 返回里带 jobId，且进度接口认这个 id
+   *   ③ 认不出的 id 要**明确说**"任务不在了"，而不是让界面转到天荒地老
+   *
+   * ⚠️ 这里**不测**"clone 真的跑成功"：本沙箱起不了 git 的传输栈
+   *    （见文件头注释），所以任务会走到 git 那一步失败 —— 那正好也是
+   *    「失败要说人话」这一条的现成夹具。
+   */
+  const t0 = Date.now()
+  const started = await core.coreHandlers['setup.clone']({ repo: 'https://github.com/o/repo-that-does-not-exist.git', dir: path.join(tmpRoot, 'job-target') })
+  const ms = Date.now() - t0
+  check('【核心】动作**立刻**返回（没有等 clone 跑完）', ms < 2000, ms + ' ms')
+  check('  返回 async:true 与一个 jobId', started.async === true && !!started.jobId, String(started.jobId))
+  check('  第一帧就带了状态字段（界面不必先猜）',
+    typeof started.status === 'string' && typeof started.percent === 'number',
+    started.status + ' / ' + started.percent + '%')
+
+  const p1 = await core.coreHandlers['setup.progress']({ jobId: started.jobId })
+  check('进度接口认得这个 jobId', p1.ok === true && p1.jobId === started.jobId, String(p1.error || p1.status))
+  check('  进度里有阶段话术（不是空字符串）', typeof p1.step === 'string' && p1.step.length > 0, p1.step)
+  check('  百分比在 0..100 之间', p1.percent >= 0 && p1.percent <= 100, String(p1.percent))
+
+  // 等一会儿再看：在沙箱里它会走到 git 失败（这正是"失败要说人话"的现成夹具）
+  let last = p1
+  for (let i = 0; i < 20 && !last.done; i++) {
+    await new Promise((r) => setTimeout(r, 250))
+    last = await core.coreHandlers['setup.progress']({ jobId: started.jobId })
+  }
+  check('  任务最终会收敛到 done（不是永远 running）', last.done === true, last.status)
+  check('  最终状态是 failed 或 done 之一（不会是别的词）',
+    last.status === 'failed' || last.status === 'done', last.status)
+  check('  失败时 result 里带**能照做**的说明（沙箱里是"跑不了 git"）',
+    last.status !== 'failed' || !!(last.result && last.result.error && last.result.error.length > 20),
+    last.result ? String(last.result.error).slice(0, 90) : '(done)')
+
+  const bogus = await core.coreHandlers['setup.progress']({ jobId: 'clone-不存在的任务' })
+  check('【不许转到天荒地老】认不出的 jobId → 明确报错并给做法',
+    bogus.ok === false && /重新点一次|过期/.test(bogus.error || ''), bogus.error)
 }
 
 // ── ⑧b 回归：**升级上来的机器**不该被逼着再 clone 一份 ────────────────────
@@ -470,7 +538,23 @@ console.log('\n=== ⑨ 两个客户端：同一份向导代码 + 真的挂进面
     //    （没有 Card 后缀）—— 第一版写成 `h\((Teacher)?ReadinessCard`，
     //    学生端匹配得上、教师端永远匹配不上，红的看起来像「教师端漏了」。
     check(who + '：没配过时把就绪清单藏起来（不并排说同一件事）',
-      /workspaceResolved === false\) \? null : h\((?:Teacher)?Readiness(?:Card)?\b/.test(t))
+      /workspaceResolved === false\) \? null : h\((?:Teacher)?Readiness(?:\s*Card)?|workspaceResolved === false\) \? null : h\((?:Teacher)?Readiness(?:Card)?\b/.test(t))
+    /* ── 进度条：老师提的「加一个进度条可视化」───────────────────────────
+     * clone 从"一个同步动作"改成了"后台任务 + 轮询"，所以这几条要在**客户端**钉：
+     *   · 真的去轮询进度（不是起完任务就干等）
+     *   · 组件卸载后**停轮询**（否则对着已卸载的组件 setState）
+     *   · 真的画了进度条（宽按百分比撑开），而不只是显示一个数字
+     *   · 单次轮询失败不算失败、连错才判失败（网络抖一下不该报"clone 失败"）
+     */
+    check(who + '：起了任务之后**轮询**进度（api setup.progress）',
+      /api\('setup\.progress'/.test(t))
+    check(who + '：卸载后停止轮询（mountedRef 守卫）',
+      /mountedRef/.test(t) && /mountedRef\.current === false/.test(t))
+    check(who + '：真的画了进度条（宽度按百分比撑开，不只是显示数字）',
+      /width: Math\.max\(2, Math\.min\(100,/.test(t))
+    check(who + '：单次轮询失败不判失败（连错 3 次才判）', /fails >= 3/.test(t))
+    check(who + '：跑完时用最后一次响应里的 result（不再多发一次请求）',
+      /if \(s\.done\)/.test(t) && /s\.result/.test(t))
   }
 }
 

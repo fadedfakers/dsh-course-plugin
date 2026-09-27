@@ -243,6 +243,74 @@ export function versionArgs() {
 }
 
 /**
+ * 把 git 的一行进度**解析成界面能画的东西**。
+ *
+ * ── 为什么值得单独一个函数 ──────────────────────────────────────────────
+ * clone 一个 15 MB 的课程仓要几十秒，而界面在此之前只能说一句"处理中…"。
+ * git 自己一直在往 stderr 写进度（`--progress` 就是为这个加的），
+ * 我们不解析它，用户就只能干等 —— 老师这次提的就是「加一个进度条可视化」。
+ *
+ * git 的进度行长这样（实测）：
+ *   `Receiving objects:  45% (1234/2871), 3.21 MiB | 1.2 MiB/s`
+ *   `Resolving deltas: 100% (500/500), done.`
+ *   `remote: Enumerating objects: 2871, done.`
+ * 所以能拿到：**阶段名、百分比、已处理/总数、速率**。
+ *
+ * ⚠️ 三种情况都要给出"能有话说"的结果，而不是空：
+ *   ① 有百分比 → 画进度条（这是绝大多数时候）
+ *   ② 有阶段名没百分比（`remote: Enumerating objects: 2871, done.`）→ 只说阶段
+ *   ③ 完全不是进度行（报错、`Cloning into ...`）→ `kind:'other'`，调用方自己决定
+ * 界面**不许**自己解析这些字符串：正则只有一处（这里），
+ * 两处各写一份的话，git 换个版本输出格式就会让进度条静默失效。
+ *
+ * @param {string} line git stderr 里的一行（**已去掉 \r**）
+ * @returns {{kind:'progress'|'phase'|'other', phase:string, percent:number|null, counts:string, rate:string, raw:string}}
+ */
+export function parseGitProgress(line) {
+  // git 用 `\r` 原地刷新，所以一行里可能塞了多段；调用方按 `[\r\n]` 切过之后，
+  // 这里再兜一次（拿最后一段 = 最新的一段）。
+  const raw = String(line == null ? '' : line).split('\r').filter((s) => s.trim()).pop() || ''
+  const s = raw.trim()
+  if (!s) return { kind: 'other', phase: '', percent: null, counts: '', rate: '', raw: '' }
+  // 掐掉 `remote: ` 前缀（服务端说的话），保留后面的阶段名
+  const body = s.replace(/^remote:\s*/i, '')
+  const mPct = /^([A-Za-z][A-Za-z .\-]*?):\s+(\d{1,3})%\s*\((\d+)\/(\d+)\)(?:,\s*([^,]+?(?:\/s)?))?/.exec(body)
+  if (mPct) {
+    const pct = Math.max(0, Math.min(100, Number(mPct[2])))
+    return {
+      kind: 'progress',
+      phase: mPct[1].trim(),
+      percent: pct,
+      counts: mPct[3] + '/' + mPct[4],
+      rate: (mPct[5] || '').trim(),
+      raw: s,
+    }
+  }
+  // 没有百分比的阶段行：`Enumerating objects: 2871, done.` / `Compressing objects: 100% …` 之外的
+  const mPhase = /^([A-Za-z][A-Za-z .\-]*?):\s*(.*)$/.exec(body)
+  if (mPhase && !/^fatal|^error|^warning/i.test(body)) {
+    return { kind: 'phase', phase: mPhase[1].trim(), percent: null, counts: mPhase[2].slice(0, 60), rate: '', raw: s }
+  }
+  return { kind: 'other', phase: '', percent: null, counts: '', rate: '', raw: s }
+}
+
+/** 阶段名 → 中文。**查不到就原样返回**（宁可显示英文，也不要显示"未知"） */
+export function phaseLabel(phase) {
+  const map = {
+    'Enumerating objects': '正在清点对象',
+    'Counting objects': '正在清点对象',
+    'Compressing objects': '正在压缩',
+    'Receiving objects': '正在接收',
+    'Resolving deltas': '正在合并差异',
+    'Updating files': '正在写入文件',
+    'Checking out files': '正在检出文件',
+    'Cloning into': '正在准备',
+  }
+  const k = Object.keys(map).find((x) => String(phase).toLowerCase().indexOf(x.toLowerCase()) === 0)
+  return k ? map[k] : String(phase || '')
+}
+
+/**
  * 把一段 `git clone` 的输出说成人话。
  *
  * 为什么必须挑着说：`--progress` 会往 stderr 里刷几十行

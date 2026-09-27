@@ -28,6 +28,7 @@ import path from 'node:path'
 import os from 'node:os'
 import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
+import { spawn } from 'node:child_process'
 // 缓存层：派生数据（课程树 / 提交清单）的加速。单一事实来源仍是磁盘原始文件，
 // 条目按来源 mtime+size 失效；缓存坏了只会退化成重算，不会让面板出错。
 import { cached, statOf, sameStat, clearCache, cacheInfo, cacheDir } from './cache.js'
@@ -41,6 +42,7 @@ import { versionInfo, versionSummary } from './version.js'
 import {
   parseRepoInput, defaultTargetDir, inspectTarget, judgeTarget, WORKSPACE_MARKER,
   courseConfigFromIndex, cloneArgs, versionArgs, explainCloneOutput,
+  parseGitProgress, phaseLabel,
 } from './setup.js'
 // 媒体的取用策略（本地优先 → 远程回退 → 落缓存）。纯函数放这里，
 // 真正的 fetch / 写盘在 createCore 的 registerMedia 里。
@@ -1215,6 +1217,13 @@ export function createCore(ctx, opts) {
    *   ④ 校验结构索引（这是「解析器认工作区的唯一依据」）
    *   ⑤ 认下来（同步换值）→ ⑥ 写配置文件 + 课程配置（失败不影响本次可用）
    */
+  /**
+   * 同步版的 clone（**现在没人调它了**，留着是因为它把"顺序与每步的说法"写全了，
+   * 而 `runCloneJob` 是它的异步孪生兄弟）。
+   *
+   * ⚠️ 两处逻辑必须一致 —— 改一处要看另一处。真正在跑的是 `runCloneJob`。
+   *    判据：`verify-setup-wizard.mjs` 的 ⑧ 与 ⑧c 分别走这两条路，任一处漂移都会红。
+   */
   async function setupClone(input) {
     const repoInput = oneLine(input.repo)
     const parsed = parseRepoInput(repoInput)
@@ -1295,15 +1304,258 @@ export function createCore(ctx, opts) {
     return { ok: true, mode: 'existing', dir: target, course: adopted.course, courseConfig: cfg, workspaceFile: wf }
   }
 
+  /**
+   * clone 之前的**同步判断**：解析地址 → 看落点现状 → 判断能不能往下走。
+   *
+   * ── 为什么单独抽出来（而不是留在任务里）──────────────────────────────────
+   * 这三步**不碰网络、不起进程**，快得可以忽略；而它们要回答的恰恰是
+   * 「这个地址/这个落点行不行」—— 用户最想**立刻**知道的那类问题。
+   * 放进异步任务之后，这些判断会拖到"下一帧"才回来，界面上先闪一下
+   * "准备中…" 再报错，而错误本来可以瞬间给出。
+   * 所以：**能同步回答的都同步回答**，只有真的 clone 才进任务。
+   *
+   * 两条路（`startCloneJob` 与这里的 `plan`）**必须给出同一套判据** ——
+   * 断言 `verify-setup-wizard.mjs` 对有副作用的那几条只测 plan（同步、可测），
+   * 对"起任务"只测它立刻返回 jobId。
+   *
+   * @returns {{ok:true, parsed:object, target:string, state:object}
+   *          |{ok:false, step:string, error:string, state?:object}}
+   */
+  function planClone(input) {
+    const repoInput = oneLine(input && input.repo)
+    const parsed = parseRepoInput(repoInput)
+    if (!parsed.ok) return { ok: false, step: 'parse', error: parsed.error }
+    const wantDir = oneLine(input && input.dir) || defaultTargetDir(os.homedir(), parsed.name, COURSE.code)
+    const target = path.resolve(wantDir)
+    const state = inspectTarget(target, {
+      exists: (p) => fs.existsSync(p),
+      isDir: (p) => { try { return fs.statSync(p).isDirectory() } catch (e) { return false } },
+      listDir: (p) => { try { return fs.readdirSync(p) } catch (e) { return [] } },
+    })
+    const verdict = judgeTarget(state)
+    if (!verdict.ok) {
+      return {
+        ok: false, step: 'inspect', state, mode: verdict.mode, error: verdict.note,
+        // 「已经是仓库」那一档不是错误，是**换一条路**：直接用现有目录（见 startCloneJob）
+        useExisting: verdict.mode === 'use-existing',
+      }
+    }
+    return { ok: true, parsed, target, state }
+  }
+
+  /**
+   * ── clone 放进后台任务（老师提的「加一个进度条可视化」）────────────────────
+   *
+   * 为什么要变成"任务"而不是一个同步动作：
+   *   clone 一个课程仓要几十秒到几分钟，而界面在此之前只能说一句"处理中…"。
+   *   git 自己一直在往 stderr 写进度（`--progress` 就是干这个的），我们要做的是
+   *   **把它接出来给界面**，而不是让用户对着一个不动的小时转圈。
+   *
+   * ── 为什么用 spawn 而不是 runCaptured ────────────────────────────────────
+   * `runCaptured` 是**同步**的：它要等子进程结束才返回，中间拿不到任何东西。
+   * 而这里要边跑边读。所以用 `spawn`，并且**沿用同一套沙箱绕法**：
+   *   本沙箱不给命名管道（带管道的 `stdio: 'pipe'` 一律 EPERM，而且不抛异常），
+   *   所以 stdout/stderr 重定向到**文件**，再由轮询去读那个文件的最新一行。
+   *   这与 runCaptured 的做法一致，只是把"跑完再读"换成"边跑边读"。
+   *
+   * ⚠️ 由此带来两个必须守住的性质：
+   *   ① 轮询读文件**每次都要容错**（文件还没建、只写了一半、被删了）——
+   *      轮询里的异常绝对不能冒出去把任务弄挂；
+   *   ② 任务状态要能被**多次**读（界面每 500ms 读一次），而且**跑完不能立刻删**——
+   *      否则最后一次读到的还是 running，界面会永远停在 99%。
+   */
+  const cloneJobs = new Map()
+  const CLONE_JOB_TTL_MS = 10 * 60 * 1000
+
+  /** 起一个任务：立刻返回 jobId，clone 在后台跑 */
+  function startCloneJob(input) {
+    const jobId = 'clone-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8)
+    const job = {
+      id: jobId, status: 'running', step: '准备中', percent: 0, phase: '', counts: '', rate: '',
+      dir: '', remote: '', startedAt: Date.now(), endedAt: 0, result: null, lines: [],
+    }
+    cloneJobs.set(jobId, job)
+    // 清理过期任务（跑完 10 分钟后丢掉，避免长跑进程里越积越多）
+    for (const [k, v] of cloneJobs) {
+      if (v.endedAt && Date.now() - v.endedAt > CLONE_JOB_TTL_MS) cloneJobs.delete(k)
+    }
+    // 立刻开跑（不 await）：动作本身马上返回 jobId，界面靠 setup.progress 轮询
+    Promise.resolve().then(() => runCloneJob(job, input)).catch((e) => {
+      job.status = 'failed'
+      job.endedAt = Date.now()
+      job.result = { ok: false, step: 'clone', error: 'clone 任务内部错误：' + oneLine(e && e.message) }
+    })
+    return jobId
+  }
+
+  async function runCloneJob(job, input) {
+    // ⚠️ 判断全部走 planClone（同步、与界面那一条路**同一套判据**）——
+    //    两处各写一份的话，"界面上说不行、任务里却继续跑"这种分叉迟早会出现。
+    const plan = planClone(input)
+    if (!plan.ok) {
+      job.dir = plan.target || job.dir
+      // 「已经是仓库」：不 clone，直接认下来（这多半是用户指到了自己的旧 clone）
+      if (plan.useExisting) {
+        job.step = '检查落点'
+        const adopted = adoptWorkspace(path.resolve(oneLine(input.dir) || plan.target), '首次启动向导（已有仓库）')
+        if (adopted.ok) {
+          const cfg = ensureCourseConfig(path.resolve(oneLine(input.dir) || plan.target))
+          const wf = writeWorkspaceFile(path.resolve(oneLine(input.dir) || plan.target))
+          job.status = 'done'; job.endedAt = Date.now(); job.percent = 100; job.step = '已认下来（没有 clone）'
+          job.result = {
+            ok: true, mode: 'existing', dir: path.resolve(oneLine(input.dir) || plan.target),
+            steps: [{ cmd: '（已在本地，未 clone）', code: 0, out: '' }],
+            courseConfig: cfg, workspaceFile: wf, course: adopted.course,
+          }
+          return
+        }
+      }
+      job.status = 'failed'; job.endedAt = Date.now()
+      job.result = { ok: false, step: plan.step, error: plan.error }
+      return
+    }
+    const { parsed, target } = plan
+    job.dir = target
+    job.remote = parsed.remote
+    // ⚠️ 这一行在重构时被漏掉过一次：`git` 没定义，于是任务走到这里就抛
+    //    「git is not defined」，而它被任务外层的 catch 包成"内部错误" ——
+    //    用户看到的是"clone 任务内部错误"，完全不知道是缺了一行赋值。
+    //    断言 ⑧c 抓到的（它读 result.error 的内容）。
+    const git = gitBin()
+    job.step = '检查 git'
+    const probe = runCaptured(git, versionArgs(), { timeout: 20000, hintDir: findWriteHint() })
+    if (runExitCode(probe) !== 0) {
+      job.status = 'failed'; job.endedAt = Date.now()
+      job.result = {
+        ok: false, step: 'git',
+        error: '这台机器上跑不了 git（' + git + '）：' + (runOutput(probe) || '没有输出')
+          + '　git 是 clone 与后续「拉取更新」都要用的东西，先装它（或把它放进 PATH）再回来。',
+      }
+      return
+    }
+    fs.mkdirSync(path.dirname(target), { recursive: true })
+
+    // ── 真正跑 clone：输出重定向到文件，边跑边读 ──
+    const args = cloneArgs(parsed.remote, target)
+    job.step = '正在 clone'
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cip-clone-'))
+    const outPath = path.join(tmp, 'out.txt')
+    const errPath = path.join(tmp, 'err.txt')
+    const r = await new Promise((resolve) => {
+      let child = null
+      let settled = false
+      const finish = (v) => { if (!settled) { settled = true; resolve(v) } }
+      try {
+        const ofd = fs.openSync(outPath, 'w')
+        const efd = fs.openSync(errPath, 'w')
+        child = spawn(git, args, { stdio: ['ignore', ofd, efd], windowsHide: true })
+        const timer = setInterval(() => {
+          // 轮询 stderr 的最新一行 → 解析成进度。**所有异常都吞掉**：
+          // 轮询失败最多是进度不动，绝不能把 clone 弄挂。
+          try {
+            if (!child.__cipFdsClosed) { /* 见下面 close 处理 */ }
+            const tail = fs.readFileSync(errPath, 'utf8')
+            const last = tail.split(/[\r\n]/).filter((s) => s.trim()).pop() || ''
+            const p = parseGitProgress(last)
+            if (p.kind === 'progress') {
+              job.phase = p.phase
+              job.step = phaseLabel(p.phase) + (p.counts ? '（' + p.counts + '）' : '')
+              job.counts = p.counts
+              job.rate = p.rate
+              // clone 的进度条上限给到 95%：最后 5% 留给"校验 + 认下来 + 写配置"，
+              // 否则进度条会先到 100% 再卡住，看起来像卡死
+              job.percent = Math.min(95, Math.round(p.percent * 0.95))
+            } else if (p.kind === 'phase') {
+              job.step = phaseLabel(p.phase)
+              job.phase = p.phase
+            }
+          } catch (e) { /* 轮询读不到就跳过这一轮 */ }
+        }, 400)
+        child.on('error', (e) => { clearInterval(timer); finish({ status: null, error: e }) })
+        child.on('close', (code) => {
+          clearInterval(timer)
+          try { fs.closeSync(ofd) } catch (e) { /* 已关 */ }
+          try { fs.closeSync(efd) } catch (e) { /* 已关 */ }
+          finish({ status: code, error: null })
+        })
+      } catch (e) { finish({ status: null, error: e }) }
+    })
+    let stdout = ''
+    let stderr = ''
+    try { stdout = fs.readFileSync(outPath, 'utf8') } catch (e) { /* 没有就没有 */ }
+    try { stderr = fs.readFileSync(errPath, 'utf8') } catch (e) { /* 同上 */ }
+    const captured = { status: r.status, stdout, stderr, error: r.error }
+    const explained = explainCloneOutput(captured, parsed.name)
+    const steps = [{ cmd: 'git ' + args.join(' '), code: runExitCode(captured), out: runOutput(captured).slice(-4000) }]
+    try { fs.rmSync(tmp, { recursive: true, force: true }) } catch (e) { /* 清不掉不影响 */ }
+    if (!explained.ok) {
+      job.status = 'failed'; job.endedAt = Date.now(); job.step = 'clone 失败'
+      job.result = { ok: false, step: 'clone', error: explained.why, steps, remote: parsed.remote, dir: target }
+      return
+    }
+    job.percent = 96; job.step = '校验课程结构'
+    const marker = path.join(target, WORKSPACE_MARKER[0], WORKSPACE_MARKER[1])
+    if (!fs.existsSync(marker)) {
+      job.status = 'failed'; job.endedAt = Date.now()
+      job.result = {
+        ok: false, step: 'verify', steps, remote: parsed.remote, dir: target,
+        error: 'clone 成功了，但这个仓里没有「' + WORKSPACE_MARKER.join('\\') + '」——'
+          + '它可能只是一个空仓、或者不是课程仓（老师那边还没发布过）。'
+          + '请找老师确认公开仓，或改填另一个地址。落点：' + target,
+      }
+      return
+    }
+    job.percent = 98; job.step = '登记到面板'
+    const adopted = adoptWorkspace(target, '首次启动向导（clone 下来的）')
+    if (!adopted.ok) {
+      job.status = 'failed'; job.endedAt = Date.now()
+      job.result = { ok: false, step: 'verify', error: adopted.error, steps, dir: target }
+      return
+    }
+    const cfg = ensureCourseConfig(target)
+    const wf = writeWorkspaceFile(target)
+    job.status = 'done'; job.endedAt = Date.now(); job.percent = 100; job.step = '配好了'
+    job.result = {
+      ok: true, mode: 'clone', dir: target, remote: parsed.remote, steps,
+      course: adopted.course, courseConfig: cfg, workspaceFile: wf,
+    }
+  }
+
+  /** 界面轮询它拿进度：只回状态，不回大块数据（每次 500ms 一次的东西要小） */
+  function cloneProgress(jobId) {
+    const job = cloneJobs.get(String(jobId || ''))
+    if (!job) return { ok: false, error: '这个任务不在了（可能已过期，或宿主重启过）—— 重新点一次即可。' }
+    return {
+      ok: true, jobId: job.id, status: job.status,
+      step: job.step, phase: job.phase, percent: job.percent, counts: job.counts, rate: job.rate,
+      dir: job.dir, remote: job.remote,
+      elapsedMs: (job.endedAt || Date.now()) - job.startedAt,
+      done: job.status !== 'running',
+      result: job.status === 'running' ? null : job.result,
+    }
+  }
+
   /** runCaptured 的临时文件落点提示：工作区可能是空的，用一个必然可写的目录。 */
-  function findWriteHint() {
-    try { return fs.existsSync(WORKSPACE) ? WORKSPACE : os.homedir() } catch (e) { return undefined }
+  function findWriteHint() {    try { return fs.existsSync(WORKSPACE) ? WORKSPACE : os.homedir() } catch (e) { return undefined }
   }
 
   /** 向导的动作集合。各插件在自己的 handlers 里 `...core.coreHandlers` 合并进去。 */
   const coreHandlers = {
     'setup.info': async () => setupState(),
-    'setup.clone': async (args) => setupClone(args && typeof args === 'object' ? args : {}),
+    /**
+     * ⚠️ 这个动作**不再**同步跑完 clone —— 它起一个后台任务，立刻返回 `jobId`。
+     *
+     * 为什么改：clone 要几十秒到几分钟，同步动作会让界面卡在"处理中…"，
+     * 用户既看不到进度、也不知道是不是死了（老师这次提的就是「加一个进度条可视化」）。
+     * 返回值里带上任务状态的第一帧，界面就不必先猜再轮询。
+     * 界面拿 `setup.progress` 每 500ms 轮一次，跑完时最后一次响应里带 `result`。
+     */
+    'setup.clone': async (args) => {
+      const input = args && typeof args === 'object' ? args : {}
+      const jobId = startCloneJob(input)
+      return Object.assign({ ok: true, async: true, jobId }, cloneProgress(jobId))
+    },
+    'setup.progress': async (args) => cloneProgress(args && args.jobId),
     'setup.use': async (args) => setupUse(args && typeof args === 'object' ? args : {}),
     // 「资料」页的数据源。与 setup.* 放在一起的理由一样：
     // 它是**两端都要有**的内核能力（学生要下载、老师要核对清单），
@@ -2428,6 +2680,9 @@ export function createCore(ctx, opts) {
     //    （有断言守着，见 verify-setup-wizard.mjs）。
     coreHandlers,
     setupState,
+    // 同步的 clone 前置判断（不起进程、不联网）：断言用它测「地址/落点行不行」那几条，
+    // 界面用它… 不用 —— 但两处的判据必须是同一份，所以它得能被测到。
+    planClone,
     // 诊断
     info: () => {
       // 版本信息：**这套面板与课程内容是哪个版本**。

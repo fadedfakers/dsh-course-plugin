@@ -1421,6 +1421,11 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = React.useState(false)
       const [result, setResult] = React.useState(null)
       const [err, setErr] = React.useState('')
+      // 进度：宿主那个 clone 任务的状态（null = 还没起任务）
+      const [prog, setProg] = React.useState(null)
+      // 组件是否还挂着 —— 轮询回调要靠它决定"还要不要继续"
+      const mountedRef = React.useRef(true)
+      React.useEffect(() => () => { mountedRef.current = false }, [])
       const suggestedDir = (sp.home || '') + '\\DSH-' + (sp.courseCode || 'course')
       const dirValue = dir || suggestedDir
       // 宿主没给出 setup（老宿主半区没重启）时**不能装死**：那种情况下
@@ -1434,12 +1439,54 @@ window.__ModuleLoader__.load({
       // 一个长期挂在面板顶上的设置块，会让人以为每次都要点它。
       if (resolved) return null
 
+      /**
+       * 「取下来，配好」—— 起任务 + **轮询进度**。
+       *
+       * 为什么不是一次 await 到底：clone 一个课程仓要几十秒到几分钟，
+       * 宿主把这段变成了一个后台任务（`setup.clone` 立刻返回 jobId），
+       * 于是界面能一边转一边报进度 —— 老师提的「加一个进度条可视化」。
+       *
+       * ⚠️ 轮询的三条纪律（都会真实发生）：
+       *   ① **必须能停**：组件卸载（用户切走页面）后回调还在跑的话，
+       *      轻则白耗请求，重则对着已卸载的组件 setState；用 mountedRef 兜住。
+       *   ② **单次轮询失败不算失败**：网络抖一下、宿主忙一下都会有；
+       *      连错 3 次才判定失败，否则慢一点的 clone 会被误报成"失败"。
+       *   ③ 跑完（`done`）时**最后一次响应里带 result** —— 不要再发一次请求，
+       *      那会多一个"结果还没到"的中间态，而它没有任何用。
+       */
       const callClone = async () => {
-        setBusy(true); setErr(''); setResult(null)
+        setBusy(true); setErr(''); setResult(null); setProg(null)
+        let jobId = ''
         try {
           const r = await api('setup.clone', { repo: repo, dir: dirValue })
-          if (r && r.ok) { setResult(r); await onDone() } else { setErr((r && r.error) || 'clone 失败（宿主没给原因）') }
-        } catch (e) { setErr('' + ((e && e.message) || e)) } finally { setBusy(false) }
+          if (!r || !r.ok) { setErr((r && r.error) || '没能起 clone 任务（宿主没给原因）'); setBusy(false); return }
+          jobId = r.jobId
+          setProg(Object.assign({}, r))
+        } catch (e) { setErr('' + ((e && e.message) || e)); setBusy(false); return }
+        let fails = 0
+        for (let i = 0; i < 1800; i++) {          // 上限：约 15 分钟，够一个慢网络的大仓
+          if (mountedRef && mountedRef.current === false) return
+          await new Promise((res) => setTimeout(res, 500))
+          let s = null
+          try { s = await api('setup.progress', { jobId: jobId }) } catch (e) { s = null }
+          if (!s || !s.ok) {
+            fails += 1
+            // 任务不在了（宿主重启 / 过期）→ 立刻说清楚，不要转到天荒地老
+            if (s && s.error) { setErr(s.error); setBusy(false); return }
+            if (fails >= 3) { setErr('读不到 clone 进度了（连试 3 次）—— 刷新一下面板看有没有配好。'); setBusy(false); return }
+            continue
+          }
+          fails = 0
+          setProg(s)
+          if (s.done) {
+            const rr = s.result
+            if (rr && rr.ok) { setResult(rr); await onDone() } else { setErr((rr && rr.error) || 'clone 失败（宿主没给原因）') }
+            setBusy(false)
+            return
+          }
+        }
+        setErr('等了 15 分钟还没跑完 —— 网络可能太慢，或者 git 卡住了。刷新面板看看，必要时换个落点重试。')
+        setBusy(false)
       }
       const callUse = async () => {
         setBusy(true); setErr(''); setResult(null)
@@ -1481,9 +1528,32 @@ window.__ModuleLoader__.load({
           }, busy ? '处理中…' : '取下来，配好'),
           h('button', { className: 'k42', disabled: busy, onClick: () => setOpen(!open) },
             open ? '收起更多选项' : '更多选项')),
+        // 进度：有百分比就画条，没有就只说阶段（git 的 "Enumerating objects" 那一段没有百分比）
         busy
-          ? h('div', { className: 'k57' }, '第一次 clone 可能要几十秒（取决于仓的大小与网速）；'
-            + '这期间界面可以继续用，别关掉面板。')
+          ? h('div', { className: 'kcb', style: { marginTop: '8px' } },
+            h('div', { className: 'kc8' },
+              bdg(prog ? ((prog.percent || 0) + '%') : '…', 'var(--dsw-alias-bg-layer-1)'),
+              h('span', { className: 'k57' }, (prog && prog.step) || '正在准备…'),
+              prog && prog.elapsedMs
+                ? h('span', { className: 'k57' }, '已用 ' + Math.round(prog.elapsedMs / 1000) + ' 秒')
+                : null,
+              prog && prog.rate ? h('span', { className: 'k57' }, prog.rate) : null),
+            // 进度条本体：外层当轨道、内层按百分比撑宽（纯 div，样式内联，
+            // 因为它是**这个组件**的样子，不依赖主题令牌，也就不会因换肤而消失）
+            h('div', {
+              style: {
+                height: '6px', borderRadius: '3px', background: 'var(--dsw-alias-bg-layer-1)',
+                border: '1px solid var(--line)', overflow: 'hidden', marginTop: '6px',
+              },
+            }, h('div', {
+              style: {
+                height: '100%', width: Math.max(2, Math.min(100, (prog && prog.percent) || 0)) + '%',
+                background: 'var(--accent, #2f6feb)', transition: 'width .3s ease',
+              },
+            })),
+            h('div', { className: 'k57' }, '第一次 clone 可能要几十秒到几分钟（取决于仓的大小与网速）；'
+              + '这期间界面可以继续用，别关掉面板。')
+              + (prog && prog.dir ? h('span', { className: 'k57' }, '　落到 ' + prog.dir) : null))
           : null,
         open
           ? h('div', null,
@@ -1608,7 +1678,24 @@ window.__ModuleLoader__.load({
 
     function Materials({ st, set, onJump, matPrefix }) {
       const m = st.materials
-      if (!m) return h('div', { className: 'k21' }, '资料清单加载中…')
+      /**
+       * ⚠️ null 分**两种**，必须分开说 —— 这是实机截图暴露的：
+       *   · 还没回来（第一次拉取中）→「正在读资料清单…」
+       *   · **拉失败了**（动作不存在 / 宿主没重启 / 清单读不出来）→ 明说失败与原因
+       * 原来两种情况都显示「资料清单加载中…」，于是一次失败看起来像**永远在加载**——
+       * 老师截图问的正是这个。一个永远转圈的界面比一条错误更难查：
+       * 它不告诉你该做什么。
+       */
+      if (!m) {
+        return st.materialsError
+          ? h('div', { className: 'k46' },
+            h('div', { className: 'k64' }, '资料'),
+            h('div', { className: 'k52 k53', style: { margin: '8px 0 0' } },
+              '资料清单读不出来：' + st.materialsError),
+            h('div', { className: 'k57' }, '这一页只影响「资料」；课件、提问、作业都不受影响。'
+              + '多半是宿主半区没重启（这个动作是后加的），重启 DSH 后点上面的「刷新」。'))
+          : h('div', { className: 'k21' }, '正在读资料清单…')
+      }
       if (m.readError) return h('div', { className: 'k52 k53', style: { margin: '8px 14px 0' } }, m.readError)
       if (!m.items || !m.items.length) {
         return h('div', { className: 'k46' },
@@ -1656,7 +1743,9 @@ window.__ModuleLoader__.load({
         readiness: null, wizardOpen: false, wizardStep: 1, wizardSkipped: false,
         // 资料页：materials = materials.list 的返回；matOpen = 哪一项的预览展开了
         // （存 `{title, mode, src}` 而不是下标 —— 清单会刷新，下标会漂）
-        materials: null, matOpen: null,
+        // materialsError：拉取失败的原因。**必须与"还没回来"分开** ——
+        // 否则失败会显示成"一直在加载"（实机截图里就是这个）。
+        materials: null, matOpen: null, materialsError: '',
       }
       const pair = React.useState(init)
       const st = pair[0] || init          // 状态为 null/undefined 时也不至于崩
@@ -1737,10 +1826,15 @@ window.__ModuleLoader__.load({
         // 后果是整页只显示一条报错、连课件都看不了（踩过一次）。
         // 新加的动作不该有能力把已经能用的面板弄坏。
         // 资料清单：同样是**新动作**，旧宿主上没有。单独一段 try ——
-        // 少了它只是「资料」页空着，不该影响提问/课件这些主功能（踩过一次）。
+        // 少了它只是「资料」页读不出来，不该影响提问/课件这些主功能（踩过一次）。
+        // ⚠️ 失败时**必须记下原因**并显示出来：只把 materials 置空的话，
+        //    「资料」页会永远显示"加载中…"（截图里就是这个），而真实原因是
+        //    "这个动作在运行中的宿主里还不存在"。两者在界面上长得一样，但一个是等、一个是错。
         try {
-          set({ materials: await api('materials.list', {}) })
-        } catch (err) { /* 没资料清单也能用 */ }
+          set({ materials: await api('materials.list', {}), materialsError: '' })
+        } catch (err) {
+          set({ materials: null, materialsError: (err && err.message) || String(err) })
+        }
         // 就绪清单：同样是**新动作**，旧宿主上不存在。
         // 单独一段 try —— 新加的动作不该有能力把已经能用的面板弄坏（踩过一次）。
         try {
