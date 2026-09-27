@@ -200,6 +200,43 @@ check('教师端前缀 /cip-tea 有 ' + teaPaths.length + ' 条', teaPaths.lengt
 check('  两端各有独立诊断页路由', stuPaths.indexOf('/cip-stu-diag') >= 0 && teaPaths.indexOf('/cip-tea-diag') >= 0)
 check('  两端各有资料文件路由（-mat）', stuPaths.indexOf('/cip-stu-mat') >= 0 && teaPaths.indexOf('/cip-tea-mat') >= 0)
 
+/* ── 1b. 学生机只装「内核 + 学生端」两个包 ────────────────────────────────
+ *
+ * 这是**README 里写给学生的安装单位**，所以必须有一条断言守住它：
+ * 学生机上没有教师端那个包，加载链是
+ *     dsh-course-student → core-loader.js → 兄弟目录 dsh-course-core
+ * 若哪天有人给 `dsh-course-student` 加了一个指向教师端的 import
+ * （或者让 core-loader 去找教师端），**在开发机上是看不出来的** ——
+ * 三个包并排都在，怎么都能加载；只有学生机的两个包形态才会红。
+ * 判据是"**只挂学生端也不报错**"，而不是"看代码里有没有 teacher 字样"
+ * （后者是假判据：学生端里本来就有 23 处 `by === 'teacher'`，那是"这条答复
+ * 是不是老师写的"，与包依赖无关）。
+ */
+console.log('\n=== 1b. 两包形态：学生机只装「内核 + 学生端」也能起来 ===')
+{
+  const freshRoutes = []
+  const stuOnlyCtx = {
+    get: (n) => (n === 'fs' ? fsShim : undefined),
+    effect: (fn) => { const d = fn(); return () => { if (typeof d === 'function') d() } },
+    webServer: { register: (r) => { freshRoutes.push(r); return () => {} } },
+  }
+  let err = null
+  try {
+    // ⚠️ 用 `?stu-only` 绕开模块缓存：上面已经 import 过一次学生端，
+    //    直接复用那个模块对象的话 `apply` 会被调第二次，而它内部
+    //    注册的 (kind,path) 与已挂载的重复 → 宿主抛错，红的会是夹具不是产品。
+    const mod = await import(pathToFileURL(nodePath.join(PACKS, 'dsh-course-student', 'src', 'host.js')).href + '?stu-only')
+    await mod.apply(stuOnlyCtx)
+  } catch (e) { err = e }
+  check('【两包形态】只挂「内核 + 学生端」不抛错（学生机的真实安装单位）',
+    err === null, err ? String((err && err.message) || err).slice(0, 140) : '')
+  check('  它注册的路由都在 /cip-stu 前缀下（没有蹭教师端的）',
+    freshRoutes.length > 0 && freshRoutes.every((r) => r.path.indexOf('/cip-stu') === 0),
+    freshRoutes.map((r) => r.path).join(' '))
+  check('  路由条数与双插件形态下学生端那一份一致',
+    freshRoutes.length === PREFIX_ROUTE_COUNT, freshRoutes.length + ' / ' + PREFIX_ROUTE_COUNT)
+}
+
 function call(pathname, body) {
   return new Promise((resolve) => {
     const res = {

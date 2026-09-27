@@ -4,11 +4,36 @@
 
 | 包 | 显示名 | 作用 |
 | --- | --- | --- |
-| `dsh-course-student` | 鼹鼠仔 | 学生端：提问与多轮追问（自费额度）、作业提交与**按教案批改**、公开问答 |
-| `dsh-course-teacher` | 至圣先师鼹鼠精 | 教师端：审计与答复、共性问题、学生名册、教案补全、大纲体检、**归档发布** |
-| `dsh-course-core` | （内核） | 两端共用：工作区解析、课程树、缓存、教案、身份、zip、材料归位、仓库管理 |
+| `dsh-course-core` | （内核） | 两端共用：工作区解析、课程树、缓存、教案、身份、zip、材料归位、仓库管理、媒体取用、资料清单、首次启动向导 |
+| `dsh-course-student` | 鼹鼠仔 | 学生端：提问与多轮追问（自费额度）、作业提交与**按教案批改**、公开问答、**资料（下载 / 在线看原件）** |
+| `dsh-course-teacher` | 至圣先师鼹鼠精 | 教师端：审计与答复、共性问题、学生名册、教案补全、大纲体检、**归档发布**、版本卡 |
 
-三个包放在同一个仓库里，因为它们必须一起装、且版本要一致（两个端各 `require` 内核的宿主半区与客户端半区）。
+三个包放在同一个仓库里，因为它们必须版本一致（两个端各 `require` 内核的宿主半区与客户端半区）。
+
+---
+
+## 〇、先分清两件事：**装插件** ≠ **拿课程内容**
+
+这两件事**是分开的**，而且顺序是固定的：
+
+```
+①  装插件（本仓）          →  你有了「面板」，但它还不知道要显示哪门课
+②  把课程仓连上（课程仓）   →  面板第一次打开会问你，填一次就好
+```
+
+**为什么必须分开**（这是本插件最重要的一条安装约定）：
+
+> 插件是**通用**的 —— 同一份插件能服务任意一门课、任意一个仓。
+> 所以「你上哪门课」不能写死在插件里，也不该由「clone 了哪个仓」隐含决定。
+> 它由**面板第一次打开时的一次确认**决定（见第二节）。
+
+**学生机只装两个包**（内核 + 学生端）。教师端是老师的机器上的东西，
+学生装它没有任何用途 —— 而且**装错了不会有任何提示**，只是多一份用不到的面板。
+
+```
+学生机：dsh-course-core + dsh-course-student     ← 两个包
+教师机：dsh-course-core + dsh-course-teacher     ← 两个包（要在同一台机器上对测两端时，三个都装）
+```
 
 ---
 
@@ -55,16 +80,41 @@
 
 ---
 
-## 二、安装
+## 二、安装插件（**这一步只装面板，不装课程内容**）
 
-需要 DSH（DeepSeek Harness）。三个包都要装。
+需要 DSH（DeepSeek Harness）。**装哪几个包取决于你是谁**：
+
+| 你是 | 装哪些 | 命令 |
+| --- | --- | --- |
+| **学生** | 内核 + 学生端（**两个**） | 见下 |
+| **老师** | 内核 + 教师端（**两个**） | 把 `student` 换成 `teacher` |
+| 老师要在**一台机器上对测两端** | 三个都装 | 三条都跑 |
+
+### 学生机
 
 ```sh
-# 把仓库 clone 到本机后，在仓库根目录执行：
-dsh plugin --profile web add ./dsh-course-core
-dsh plugin --profile web add ./dsh-course-student
-dsh plugin --profile web add ./dsh-course-teacher
+npm i -g @deepseek-ai/dsh
+npm i -g pnpm
+
+dsh plugin --profile web add github:fadedfakers/dsh-course-plugin#path:dsh-course-core
+dsh plugin --profile web add github:fadedfakers/dsh-course-plugin#path:dsh-course-student
 ```
+
+### 教师机
+
+```sh
+dsh plugin --profile web add github:fadedfakers/dsh-course-plugin#path:dsh-course-core
+dsh plugin --profile web add github:fadedfakers/dsh-course-plugin#path:dsh-course-teacher
+```
+
+> **两个包必须一起装。** 只装一端、不装 `dsh-course-core` 的话，`dsh plugin add`
+> 会**成功退出（exit=0）、包名也会进 `dsh.profile.bundles`** —— 看起来一切正常，
+> 但面板根本起不来。这是踩过的坑：两个端都通过 `src/core-loader.js` 按绝对路径
+> import 内核，少了内核它们连模块都加载不了，而报错发生在**面板打开时**，
+> 不在安装时。
+>
+> 装本地改动过的版本（开发时）：把上面的 `github:...#path:xxx` 换成本地路径，
+> 例如 `dsh plugin --profile web add ./dsh-course-core`。
 
 `dsh plugin` 会把参数转发给 profile 目录里的包管理器，并同时更新
 profile 的 `dependencies` 与 `dsh.profile.bundles` 两处 ——
@@ -72,7 +122,42 @@ profile 的 `dependencies` 与 `dsh.profile.bundles` 两处 ——
 
 装完**重启 DSH**：宿主半区是进程启动时加载的。只改客户端资源才只需刷新页面。
 
-### 装完之后你看到什么
+---
+
+## 三、把课程仓连上（**面板第一次打开时会问你**）
+
+**打开面板**（侧栏底部的「鼹鼠仔 · 课程答疑」/「至圣先师鼹鼠精」图标）。
+如果这台机器还没配过课程工作区，面板顶上会出现一块**「① 先把这台机器配好」**：
+
+| 你的情况 | 界面上怎么做 |
+| --- | --- |
+| 机器上**还没有**课程内容 | 填老师给的**公开仓地址** → 点「取下来，配好」→ 它会 clone 到 `~/DSH-<课程码>`（可以改），并显示**进度条** |
+| 机器上**已经有**课程仓（clone 过 / 从别处拷来） | 展开「更多选项」→ 填那个目录 → 点**「就用这个目录」**（只登记，不联网、不 clone） |
+
+公开仓地址长这样（老师会给）：
+
+```
+https://github.com/<owner>/<repo>.git
+```
+
+配好之后它做四件事，都会显示出来给你核对：**校验** `课程中心/课程结构索引.json` 存在
+→ **认下**工作区（不用重启）→ 写 `~/.dsh/cip-workspace.txt` → 写 `课程配置.json`（真课名取自索引）。
+
+> ⚠️ 已经有课程仓的机器（老师自己那台、或重装的机器）**不要**走 clone 那条 ——
+> clone 会得到**第二份**课程，两份互不同步。
+>
+> ⚠️ 向导有两道硬边界：目标目录里**已经有东西**时绝不覆盖（会让你换落点）；
+> 地址里带 Token 会被**拒**（那个地址会写进配置文件、显示在界面上）。
+
+### 另一种连法：课程仓的 `install.ps1`
+
+如果老师给你的课程仓里带 `install.ps1`，你也可以**先 clone 课程仓、再跑它** ——
+它会替你装插件（学生端两个包）+ 写工作区路径 + 生成课程配置，一条龙。
+两种连法写的是**同一个文件**（`~/.dsh/cip-workspace.txt`），选一种即可。
+
+---
+
+## 四、装完之后你看到什么
 
 面板不会让你先填一张长表。它会先给一张**就绪清单**，把「说不清的故障」变成「缺哪一项」：
 
@@ -89,16 +174,20 @@ profile 的 `dependencies` 与 `dsh.profile.bundles` 两处 ——
 
 1. 环境变量 `CIP_COURSE_DIR`（直接指定一门课的目录）
 2. 环境变量 `CIP_WORKSPACE`（+ 可选 `CIP_COURSE_CODE`）
-3. 配置文件 `~/.dsh/cip-workspace.txt`
+3. 配置文件 `~/.dsh/cip-workspace.txt` ← **上面的向导写的就是它**
 4. 内置默认值
 
 「验证通过」的判据是这个目录里确实有 `课程中心/课程结构索引.json`。
 多门课用共享式布局：根目录放共享内容（课件、索引、教案），
 每门课的私有数据放 `课程/<课程码>/`。
 
+> ⚠️ 第 4 条现在是**空**的 —— 内核里**没有任何写死的默认路径**。
+> 所以一台没配过的机器会**如实**报「没找到课程工作区」并走向导，
+> 而不是悄悄落到某个别人的目录上。
+
 ---
 
-## 三、两端的路由与面板
+## 五、两端的路由与面板
 
 两个插件装在同一个 DSH 进程里同时运行 —— 这是老师要在一台机器上对测两端的前提。
 硬约束只有一条，来自 DSH 本身：`webServer.register` 对重复的 `(kind, path)` **直接抛错**。
@@ -112,7 +201,7 @@ profile 的 `dependencies` 与 `dsh.profile.bundles` 两处 ——
 
 ---
 
-## 四、数据怎么在两个端之间流动
+## 六、数据怎么在两个端之间流动
 
 两个插件通过**同一个课程工作区目录**交换数据，目录分工保证每个位置只有一个写入方：
 
@@ -131,7 +220,7 @@ profile 的 `dependencies` 与 `dsh.profile.bundles` 两处 ——
 
 ---
 
-## 五、开发
+## 七、开发
 
 三个包都**没有构建步骤**：`main` 直接指向 `src/host.js`，客户端半区是已构建好的 `lib/client.js`。
 改宿主代码重启 DSH 生效；改客户端代码刷新页面生效。
@@ -145,7 +234,7 @@ KaTeX 直接内置在 `dsh-course-core/lib/katex/`，不需要联网下载。
 
 ---
 
-## 六、已知边界
+## 八、已知边界
 
 - **`/cip-stu-api`、`/cip-tea-api` 无鉴权**。假定只绑在本机回环或受信隧道后面。
   两个插件的角色差异是**界面与工作流**的差异，不是网络安全边界 ——
@@ -155,6 +244,6 @@ KaTeX 直接内置在 `dsh-course-core/lib/katex/`，不需要联网下载。
 
 ---
 
-## 七、许可
+## 九、许可
 
 MIT，见 `LICENSE`。
