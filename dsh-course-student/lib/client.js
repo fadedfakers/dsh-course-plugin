@@ -1450,11 +1450,13 @@ window.__ModuleLoader__.load({
       }
       const steps = (result && result.steps) || []
       const wf = (result && result.workspaceFile) || null
-      return h('div', { className: 'kcb', 'data-role': 'cip-setup' },
+      return h('div', { className: 'kcb', 'data-role': 'cip-setup', style: { margin: '10px 14px 0' } },
         h('div', { className: 'k64' }, '① 先把这台机器配好'),
         h('div', { className: 'kd1' }, '课程面板要读一份**课程工作区**（课件、结构索引、问题池都在里面）。'
           + '这台机器还没有它 —— 填一个地址，插件替你把它取下来。'),
-        h('div', { className: 'k57' }, '宿主说这次没找到工作区的过程：' + (sp.how || '（没说）')),
+        // 「宿主说这次没找到工作区的过程」原来是 `k57`（正文色）。它是**诊断信息**，
+        // 排在两句说明之间会把主张与细节混在一起，所以压成一行小字、颜色调暗。
+        sp.how ? h('div', { className: 'k57' }, '这次没找到工作区的过程：' + sp.how) : null,
         h('div', { className: 'kce' },
           h('span', { className: 'k57' }, '公开仓地址'),
           h('input', {
@@ -1470,10 +1472,19 @@ window.__ModuleLoader__.load({
           })),
         h('div', { className: 'k57' }, '默认落在这里（可以改）：' + suggestedDir),
         h('div', { className: 'kca' },
-          h('button', { className: 'k42 k11', disabled: busy || !repo.trim(), onClick: callClone },
-            busy ? '处理中…（第一次 clone 可能要几十秒）' : '取下来，配好'),
+          // 主按钮：实心品牌蓝 + 白字（panel.css 的 --accent / --on-accent）。
+          // 这里额外加粗并给一个最小宽度 —— 上一版它和旁边的次级按钮长得太像，
+          // 用户反馈「分不清哪个是要点的那个」。
+          h('button', {
+            className: 'k42 k11', disabled: busy || !repo.trim(),
+            style: { fontWeight: 650, minWidth: '132px' }, onClick: callClone,
+          }, busy ? '处理中…' : '取下来，配好'),
           h('button', { className: 'k42', disabled: busy, onClick: () => setOpen(!open) },
             open ? '收起更多选项' : '更多选项')),
+        busy
+          ? h('div', { className: 'k57' }, '第一次 clone 可能要几十秒（取决于仓的大小与网速）；'
+            + '这期间界面可以继续用，别关掉面板。')
+          : null,
         open
           ? h('div', null,
             h('div', { className: 'k64' }, '工作区已经在别的目录'),
@@ -1484,7 +1495,7 @@ window.__ModuleLoader__.load({
                 busy ? '处理中…' : '就用这个目录')))
           : null,
         // 成功：**留下证据**，不只是说一句「好了」——用户要能核对
-        // 「课名对不对」「落在哪」「用的哪个版本」「配置文件写没写进去」。
+        // 「课名对不对」「落在哪」「配置文件写没写进去」。
         result
           ? h('div', { className: 'kc7', 'data-ok': '1' },
             h('div', { className: 'kc8' },
@@ -1498,10 +1509,22 @@ window.__ModuleLoader__.load({
               : null,
             h('div', { className: 'k57' }, '面板已经切到这个工作区了，**不用重启**；下面几块现在就有内容。'))
           : null,
+        // 失败：**红边 + 红字**是刻意的。这一条必须一眼看出「没成功」——
+        // 上一版它和成功态用的是同一个类（只差一个 data 属性，而那两个属性
+        // 在样式表里还没有规则），于是失败看着像一句普通说明，用户会继续往下找。
         err
-          ? h('div', { className: 'kc7', 'data-err': '1' },
-            h('div', { className: 'kc8' }, bdg('没成功', 'var(--dsw-alias-state-error-primary)'), h('span', { className: 'k57' }, err)),
-            steps.length ? h('div', null, steps.map((s, i) => h('div', { key: i, className: 'k57' }, '· ' + s.cmd + '（exit ' + s.code + '）'))) : null,
+          ? h('div', {
+            className: 'kc7', 'data-err': '1',
+            style: { borderColor: 'var(--dsw-alias-state-error-primary)' },
+          },
+            h('div', { className: 'kc8' },
+              bdg('没成功', 'var(--dsw-alias-state-error-primary)'),
+              h('span', { className: 'k57', style: { color: 'var(--dsw-alias-state-error-primary)' } }, err)),
+            // 命令与退出码压成一行：好几条的时候竖着排会把它撑得很长，
+            // 而这里要传达的只是「跑的是什么、退了多少」。
+            steps.length
+              ? h('div', { className: 'k57' }, '跑过的命令：' + steps.map((s) => s.cmd + '（exit ' + s.code + '）').join('；'))
+              : null,
             h('div', { className: 'k57' }, '修好之后点上面的按钮重试即可 —— 已经 clone 下来的东西不会被删。'))
           : null)
     }
@@ -1579,6 +1602,18 @@ window.__ModuleLoader__.load({
         try {
           const info = await api('info', {})
           set({ info })
+          // ── 这台机器还没配过工作区时**到此为止**，后面的动作一个都不发 ────────
+          //
+          // 为什么必须早退（这是实机截图里暴露出来的）：那些动作全都建立在
+          // 「有一个能读的课程工作区」之上，工作区不存在时它们必然失败，
+          // 而失败会渲染成一条红色「加载失败：读课程数据失败：课程结构索引不存在」。
+          // 后果有两层：
+          //   ① 面板第一眼看到的是「坏了」，而真实情况是「还没配」——
+          //      用户会去查插件，而该做的是点上面的向导；
+          //   ② 那条红条**把向导挤到下面**，看着像插件报错而不是它在教人修。
+          // 上面的 SetupWizard 已经把那件事说清楚了（而且它就在红条上面），
+          // 所以这里静默返回即可 —— 不是吞掉错误，是**这个错误在这一档没有意义**。
+          if (info && info.setup && info.setup.workspaceResolved === false) return
           const tree = (await api('tree', {})).tree
           set({ tree })
           const ch = (info.chapters && info.chapters[0]) || '第一章'
@@ -1958,19 +1993,20 @@ window.__ModuleLoader__.load({
           }, v.label))),
           h('button', { className: 'k42', disabled: st.busy, onClick: load }, st.busy ? '处理中…' : '刷新')),
 
-        // ── 「你是这个班的谁」────────────────────────────────────────
-        // 只在两种情况出现：还没填过（identified=false，那时学号是
-        // 系统用户名 Administrator 这种），或者自己点名字要改。
-        // 不填也能用，但老师那边看到的提问者就是一串机器用户名 ——
-        // 所以这里要把后果说清楚，而不是强制填。
+        // ── 首次启动向导：**顺序是刻意的，放在最前面** ──────────────────────
+        //
+        // 它只在「这台机器没配过课程工作区」时出现（配好了返回 null）。
+        // 为什么必须排在就绪清单与红条**前面**：没有工作区的时候，
+        // 就绪清单说的那几件事全是空谈（课都没有，谈什么就绪），
+        // 而「加载失败：读课程数据失败」那条红条会把它往下挤 ——
+        // 用户看到的第一个东西应该正好是「现在该做的那一件事」。
+        h(SetupWizard, { info: st.info, api: api, onDone: load }),
         // 就绪清单 / 首次设置向导。
         // 原来这里只有一个「我是谁」卡片，现在扩成三件事的清单 ——
         // 「面板是空的」有四种完全不同的原因，而界面上看起来一模一样。
-        h(ReadinessCard, { st, set, onIdentify }),
-        // 首次启动向导：**这台机器还没配过课程工作区**时唯一该看到的东西。
-        // 放在就绪清单上面 —— 工作区都没有的时候，「还差哪几件事」是空谈。
-        // 已经配好时它自己返回 null（见 SetupWizard 里的注释）。
-        h(SetupWizard, { info: st.info, api: api, onDone: load }),
+        // ⚠️ 工作区**配好了**才有意义：没配过时它列的是「工作区 缺 / 课程 缺」，
+        //    而上面的向导已经在说同一件事，两块并排会让人以为是两个问题。
+        (st.info && st.info.setup && st.info.setup.workspaceResolved === false) ? null : h(ReadinessCard, { st, set, onIdentify }),
         st.error ? h('div', { className: 'k52 k53', style: { margin: '8px 14px 0' } }, st.error) : null,
         st.notice ? h('div', { className: 'k52 k62', style: { margin: '8px 14px 0' } }, st.notice) : null,
         st.katexError ? h('div', { className: 'k52 k53', style: { margin: '8px 14px 0' } }, '公式渲染不可用：' + st.katexError) : null,

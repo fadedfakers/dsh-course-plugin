@@ -1584,11 +1584,13 @@ window.__ModuleLoader__.load({
       }
       const steps = (result && result.steps) || []
       const wf = (result && result.workspaceFile) || null
-      return h('div', { className: 'kcb', 'data-role': 'cip-setup' },
+      return h('div', { className: 'kcb', 'data-role': 'cip-setup', style: { margin: '10px 14px 0' } },
         h('div', { className: 'k64' }, '① 先把这台机器配好'),
         h('div', { className: 'kd1' }, '课程面板要读一份**课程工作区**（课件、结构索引、问题池都在里面）。'
           + '这台机器还没有它 —— 填一个地址，插件替你把它取下来。'),
-        h('div', { className: 'k57' }, '宿主说这次没找到工作区的过程：' + (sp.how || '（没说）')),
+        // 「宿主说这次没找到工作区的过程」原来是 `k57`（正文色）。它是**诊断信息**，
+        // 排在两句说明之间会把主张与细节混在一起，所以压成一行小字、颜色调暗。
+        sp.how ? h('div', { className: 'k57' }, '这次没找到工作区的过程：' + sp.how) : null,
         h('div', { className: 'kce' },
           h('span', { className: 'k57' }, '公开仓地址'),
           h('input', {
@@ -1604,10 +1606,19 @@ window.__ModuleLoader__.load({
           })),
         h('div', { className: 'k57' }, '默认落在这里（可以改）：' + suggestedDir),
         h('div', { className: 'kca' },
-          h('button', { className: 'k42 k11', disabled: busy || !repo.trim(), onClick: callClone },
-            busy ? '处理中…（第一次 clone 可能要几十秒）' : '取下来，配好'),
+          // 主按钮：实心品牌蓝 + 白字（panel.css 的 --accent / --on-accent）。
+          // 这里额外加粗并给一个最小宽度 —— 上一版它和旁边的次级按钮长得太像，
+          // 用户反馈「分不清哪个是要点的那个」。
+          h('button', {
+            className: 'k42 k11', disabled: busy || !repo.trim(),
+            style: { fontWeight: 650, minWidth: '132px' }, onClick: callClone,
+          }, busy ? '处理中…' : '取下来，配好'),
           h('button', { className: 'k42', disabled: busy, onClick: () => setOpen(!open) },
             open ? '收起更多选项' : '更多选项')),
+        busy
+          ? h('div', { className: 'k57' }, '第一次 clone 可能要几十秒（取决于仓的大小与网速）；'
+            + '这期间界面可以继续用，别关掉面板。')
+          : null,
         open
           ? h('div', null,
             h('div', { className: 'k64' }, '工作区已经在别的目录'),
@@ -1618,7 +1629,7 @@ window.__ModuleLoader__.load({
                 busy ? '处理中…' : '就用这个目录')))
           : null,
         // 成功：**留下证据**，不只是说一句「好了」——用户要能核对
-        // 「课名对不对」「落在哪」「用的哪个版本」「配置文件写没写进去」。
+        // 「课名对不对」「落在哪」「配置文件写没写进去」。
         result
           ? h('div', { className: 'kc7', 'data-ok': '1' },
             h('div', { className: 'kc8' },
@@ -1632,10 +1643,22 @@ window.__ModuleLoader__.load({
               : null,
             h('div', { className: 'k57' }, '面板已经切到这个工作区了，**不用重启**；下面几块现在就有内容。'))
           : null,
+        // 失败：**红边 + 红字**是刻意的。这一条必须一眼看出「没成功」——
+        // 上一版它和成功态用的是同一个类（只差一个 data 属性，而那两个属性
+        // 在样式表里还没有规则），于是失败看着像一句普通说明，用户会继续往下找。
         err
-          ? h('div', { className: 'kc7', 'data-err': '1' },
-            h('div', { className: 'kc8' }, bdg('没成功', 'var(--dsw-alias-state-error-primary)'), h('span', { className: 'k57' }, err)),
-            steps.length ? h('div', null, steps.map((s, i) => h('div', { key: i, className: 'k57' }, '· ' + s.cmd + '（exit ' + s.code + '）'))) : null,
+          ? h('div', {
+            className: 'kc7', 'data-err': '1',
+            style: { borderColor: 'var(--dsw-alias-state-error-primary)' },
+          },
+            h('div', { className: 'kc8' },
+              bdg('没成功', 'var(--dsw-alias-state-error-primary)'),
+              h('span', { className: 'k57', style: { color: 'var(--dsw-alias-state-error-primary)' } }, err)),
+            // 命令与退出码压成一行：好几条的时候竖着排会把它撑得很长，
+            // 而这里要传达的只是「跑的是什么、退了多少」。
+            steps.length
+              ? h('div', { className: 'k57' }, '跑过的命令：' + steps.map((s) => s.cmd + '（exit ' + s.code + '）').join('；'))
+              : null,
             h('div', { className: 'k57' }, '修好之后点上面的按钮重试即可 —— 已经 clone 下来的东西不会被删。'))
           : null)
     }
@@ -2029,6 +2052,11 @@ window.__ModuleLoader__.load({
         try {
           const info = await api('info', {})
           set({ info })
+          // ── 这台机器还没配过工作区时**到此为止**（理由同学生端那一处）──────
+          // 后面的动作全都要「有一个能读的课程工作区」，工作区不存在时必然失败，
+          // 渲染成一条红色「加载失败」，把向导挤到下面 —— 用户第一眼看到的是
+          // 「面板坏了」，而该做的是点上面那个向导。
+          if (info && info.setup && info.setup.workspaceResolved === false) return
           set({ tree: (await api('tree', {})).tree })
           const ch = (info.chapters && info.chapters[0]) || '第一章'
           set({ chapter: ch, slides: await api('slides', { chapter: ch }) })
@@ -2247,14 +2275,19 @@ window.__ModuleLoader__.load({
             onClick: () => set({ view: v.id }),
           }, v.label))),
           h('button', { className: 'k42', disabled: st.busy, onClick: loadAll }, st.busy ? '处理中…' : '刷新')),
-        // 就绪清单 + 今天要做什么。放在最上面 —— 老师打开面板最想知道的是
-        // 「现在先干哪件事」，而不是先去五个标签页里自己拼数字。
-        h(TeacherReadiness, { st, set }),
-        // 首次启动向导：**这台机器还没配过课程工作区**时唯一该看到的东西。
-        // 老师换台电脑（办公室/家里/笔记本）撞到的就是这件事，而他手上
-        // 通常有学生用的那条公开仓命令 —— 直接填进去就能开工。
-        // 已经配好时它自己返回 null（见 SetupWizard 里的注释）。
+        // ── 首次启动向导：**顺序是刻意的，放在最前面** ──────────────────────
+        //
+        // 它只在「这台机器没配过课程工作区」时出现（配好了返回 null）。
+        // 为什么必须排在就绪清单与红条**前面**：没有工作区的时候，
+        // 就绪清单说的那几件事全是空谈（课都没有，谈什么就绪），
+        // 而加载失败的红条会把它往下挤 —— 用户看到的第一个东西
+        // 应该正好是「现在该做的那一件事」。踩过一次：向导被红条挤到下面，
+        // 看着像面板坏了，而不是「它在教你修」。
         h(SetupWizard, { info: st.info, api: api, onDone: loadAll }),
+        // 就绪清单 + 今天要做什么。工作区**配好了**才有意义 ——
+        // 没配过时它列的是「工作区 缺 / 课程 缺」，而向导已经在上面说清同一件事了，
+        // 两块并排只会让人以为是两个不同的问题。
+        (st.info && st.info.setup && st.info.setup.workspaceResolved === false) ? null : h(TeacherReadiness, { st, set }),
         st.error ? h('div', { className: 'k52 k53', style: { margin: '8px 14px 0' } }, st.error) : null,
         st.notice ? h('div', { className: 'k52 k62', style: { margin: '8px 14px 0' } }, st.notice) : null,
         h('div', { className: 'k25' },
