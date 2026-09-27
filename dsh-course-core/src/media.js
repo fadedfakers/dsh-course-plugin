@@ -183,3 +183,150 @@ export function contentTypeOf(fileName) {
   if (nm.endsWith('.md')) return 'text/markdown; charset=utf-8'
   return 'application/octet-stream'
 }
+
+/**
+ * 一次请求最多拉多少字节（超过就改用 Range 分段）。
+ *
+ * 为什么是 2 MB：实测这条链路上**单个长连接的存活时间很不稳定**——
+ * 一个 7.3 MB 的文件用「一次请求拉完」在本机连续超时（60s / 90s / 180s 都失败过），
+ * 而同一时刻用 Range 拉 1 MB 的段是**秒级成功**。也就是说失败的不是"文件太大"，
+ * 而是"一个连接活不了那么久"。
+ * 分段之后每一段都是独立的短请求：断了只重拉那一段，代价可控。
+ */
+export const MEDIA_CHUNK_BYTES = 2 * 1024 * 1024
+
+/** 默认的取回实现（宿主里用它；测试可注入自己的） */
+const defaultGet = async (url, opts) => {
+  const r = await fetch(url, opts.signal ? { signal: opts.signal, headers: opts.headers } : { headers: opts.headers })
+  const buf = Buffer.from(await r.arrayBuffer())
+  return { status: r.status, headers: r.headers, buf }
+}
+
+/**
+ * 把一条远程媒体取回来，**支持断点续传（Range 分段）**。
+ *
+ * ── 为什么不能只写 `await fetch(url)` ──────────────────────────────────
+ * 课件图里混着一张 **7 MB** 的（其余大多几十 KB）。在本机这条链路上，
+ * 「一次请求拉完」对它**稳定失败**（超时 / ECONNRESET），而分段拉就没事。
+ * 对学生的意义更直接：教室或家里的网络一断，一次请求的整份要重来，
+ * 分段则只重拉那一段。视频（将来放在同一个源上）更是必须能续。
+ *
+ * ── 逐段的判据（都可证伪）──────────────────────────────────────────────
+ *   · 服务端**不支持 Range**（回 200 而不是 206）→ 直接用这一份完整的，别坚持分段
+ *   · 某一段失败 → 只重试那一段，最多 `tries` 次；其它段不重来
+ *   · 全部拉完 → 长度必须等于 Content-Length（或 `total`），否则**报错而不是返回半张图**
+ *     （半张图是最坏的结果：浏览器显示成"图烂了"，而没人知道是下载没完成）
+ *
+ * @param {string} url
+ * @param {{get?:Function, tries?:number, chunk?:number, timeout?:number}} [opts]
+ *        get：注入的取回实现（`(url, {headers, signal}) => {status, headers, buf}`），便于断言
+ * @returns {Promise<{ok:boolean, buf?:Buffer, why?:string, chunks?:number}>}
+ */
+export async function fetchMediaResumable(url, opts) {
+  const o = opts || {}
+  const get = o.get || defaultGet
+  const tries = Math.max(1, Number(o.tries) || 4)
+  const chunk = Math.max(65536, Number(o.chunk) || MEDIA_CHUNK_BYTES)
+  const timeout = Math.max(5000, Number(o.timeout) || 60000)
+  const mkSignal = () => (typeof AbortSignal !== 'undefined' && AbortSignal.timeout ? AbortSignal.timeout(timeout) : undefined)
+
+  /** 取一段（或整份）：失败时退避重试；404 立刻返回（那是确定的答案） */
+  const one = async (from, to) => {
+    let last = ''
+    for (let i = 0; i < tries; i++) {
+      try {
+        const headers = from == null ? {} : { Range: 'bytes=' + from + '-' + to }
+        const r = await get(url, { headers, signal: mkSignal() })
+        if (r.status === 404) return { hard: true, why: 'HTTP 404（远程没有这个文件）' }
+        if (r.status === 416) return { hard: true, why: 'HTTP 416（Range 超出文件长度）' }
+        /**
+         * ⚠️ 「要了一段、回了 200」= 服务端**不支持 Range**，回的是整份。
+         *    这时要**原样收下并停止分段** —— 第一版只判断 `from > 0` 的这种情况，
+         *    第一段（from == null）走到这里会把整份当成"第一段"收下，
+         *    然后继续要第二段 → 416 → 整条路失败。
+         *    支持 Range 的源（jsDelivr / R2 / B2）回 206，这一支是给
+         *    「学校 NAS 上的静态文件服务」这类不支持的源兜底的。
+         */
+        if (r.status === 200) return { buf: r.buf, whole: true, status: 200, headers: r.headers }
+        if (r.status === 206) return { buf: r.buf, status: 206, headers: r.headers }
+        last = 'HTTP ' + r.status
+      } catch (e) { last = (e && e.name) + ': ' + ((e && e.message) || e) }
+      await new Promise((res) => setTimeout(res, 600 * (i + 1)))
+    }
+    return { why: last || '取回失败' }
+  }
+
+  const parts = []
+  let from = 0
+  let chunks = 0
+  let contentType = ''
+  let total = null          // 整份应该多大（**只认权威来源**，不靠长度猜）
+  let done = false
+  // 上限：避免服务端一直说"还有更多"而我们无限拉（也防一个坏掉的 Content-Range）
+  const MAX_PARTS = 512
+  /**
+   * ⚠️ **第一段也带 Range**，不去发一个"先探一下有多大"的裸请求。
+   *
+   * 为什么这是关键：jsDelivr 对**不带 Range** 的请求回的是 `206 + 整份内容`
+   * （而不是 200）。那条路上我们会顺着连接把整个文件读完 ——
+   * 对一个 7 MB 的文件，等于把"分段"这件事在最开始就作废了，
+   * 而且那个长连接正是实测会断的东西。
+   * 带上 `Range: bytes=0-(chunk-1)` 之后，服务端回的是**恰好一段** +
+   * `Content-Range: bytes 0-…/TOTAL`，于是"整份多大"这件事一次就问清了，
+   * 后面每一段都是独立的短请求。不依赖任何猜测。
+   *
+   * 不支持 Range 的源（某些静态文件服务）会忽略 Range 回 200 —— 那一支照样能用，
+   * 见下面 `r.status === 200` 的处理。
+   */
+  for (let guard = 0; guard < MAX_PARTS && !done; guard++) {
+    const to = from + chunk - 1
+    const got = await one(from, to)
+    if (got.hard) return { ok: false, why: got.why }
+    if (got.why) return { ok: false, why: '第 ' + (parts.length + 1) + ' 段取回失败：' + got.why }
+    if (chunks === 0) {
+      // ⚠️ Content-Type 只在第一段读得到。它必须传回给调用方做
+      //    「取回来的到底是不是图」的判断 —— 否则「名字像图、内容是 404 页面」
+      //    这一档就没法在下游拦住（实测漏过一次）。
+      contentType = (got.headers && got.headers.get && got.headers.get('content-type')) || ''
+      const cr = (got.headers && got.headers.get && got.headers.get('content-range')) || ''
+      const mcr = /bytes\s+\d+-\d+\/(\d+)/i.exec(cr)
+      if (mcr) total = Number(mcr[1])
+      else {
+        // 没有 Content-Range：要么是"服务端不支持 Range、直接给了整份"（200），
+        // 要么是它不规范。两种都只能拿这一份当结果 —— 但**必须自己知道**
+        // 是"确定的整份"还是"说不清"，下面按这个决定能不能说 ok。
+        const cl = Number((got.headers && got.headers.get && got.headers.get('content-length')) || 0)
+        total = got.whole ? (cl > 0 ? cl : got.buf.length) : null
+        if (got.whole) { parts.push(got.buf); chunks += 1; done = true; break }
+      }
+    }
+    parts.push(got.buf)
+    chunks += 1
+    from += got.buf.length
+    if (!got.buf.length) { done = true; break }
+    if (total != null) done = from >= total
+    // total 仍为 null 时**继续要下一段**：这种源不给长度，
+    // 只能靠"某一段短于 chunk"判断到底了（下面 completeness 会为这一档负责）
+    else if (got.buf.length < chunk) done = true
+  }
+  const buf = Buffer.concat(parts)
+  if (!buf.length) return { ok: false, why: '取回来是空的' }
+  /**
+   * ⚠️ 完整性判据分两种，而且**没有权威长度时不肯说 ok**。
+   *
+   *   有权威长度（Content-Range / Content-Length）→ 拿它逐字节对，对不上就失败。
+   *   没有权威长度 → 只能按「这一段没拉满就当到底了」推断，而这个推断**不可靠**：
+   *     服务端少给一个字节，我们就会把一个残缺的图当成完整交付。
+   *     返回半张图是最坏的结果 —— 浏览器显示成"图烂了"，
+   *     而没有任何人知道是下载没完成（学生会以为是课件本身坏了）。
+   *   所以这一档明说「没法确认完整性」并失败，让调用方换一个源或重试。
+   *   （实测 jsDelivr / R2 / B2 都会给 Content-Range，正常路径走不到这里。）
+   */
+  if (total == null) {
+    return { ok: false, why: '远程没有给出文件长度（没有 Content-Range / Content-Length），没法确认完整性' }
+  }
+  if (buf.length !== total) {
+    return { ok: false, why: '长度不对（期望 ' + total + '，实际 ' + buf.length + '）—— 不返回半份' }
+  }
+  return { ok: true, buf, chunks, contentType }
+}

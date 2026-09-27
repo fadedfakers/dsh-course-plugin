@@ -44,7 +44,7 @@ import {
 } from './setup.js'
 // 媒体的取用策略（本地优先 → 远程回退 → 落缓存）。纯函数放这里，
 // 真正的 fetch / 写盘在 createCore 的 registerMedia 里。
-import { validateMediaBase, mediaRemoteUrl, mediaCachePath, looksLikeMedia, contentTypeOf } from './media.js'
+import { validateMediaBase, mediaRemoteUrl, mediaCachePath, looksLikeMedia, contentTypeOf, fetchMediaResumable } from './media.js'
 // 起子进程并**收回输出**（git / 发布工具）。用它而不是 spawnSync 的 encoding：
 // 沙箱不给管道，带 encoding 的 spawnSync 一律 EPERM 且不抛异常。
 import { runCaptured, runOutput, runExitCode } from './run.js'
@@ -1803,49 +1803,64 @@ export function createCore(ctx, opts) {
     const remoteTo = async (chapter, fileName, res) => {
       const base = MEDIA_BASE
       if (!base) return false
-      const url = mediaRemoteUrl(base, chapter, fileName)
-      if (!url) return false
-      let r
-      try {
-        // 超时是必须的：教室网络半死时，一个不设超时的 fetch 会让这一页永远转圈，
-        // 而界面上看起来只是「图片加载慢」—— 那种问题最难查。
-        r = await fetch(url, { signal: AbortSignal.timeout(20000) })
-      } catch (e) {
-        cache.mediaError = '取远程媒体失败（连不上）：' + oneLine(e && e.message)
-        return false
+      /**
+       * ⚠️ 远程这一档**也要做扩展名回退**，与本地那一档完全一样。
+       *
+       * 这是实机探索抓出来的真 bug（差点就发给学生了）：
+       * `第一章.json` 的坐标里记的是**抽取时的原始扩展名**（`slide001_image1.png`），
+       * 而发出去的图是转换后的 `.webp` —— 本地那一档靠 RASTER_EXT 换扩展名找得到，
+       * 远程那一档却只会照原名请求，于是**每一张图都 404**。
+       * 症状是学生那边整页都是「图片不可用」，而老师本机一切正常（他本地有图）。
+       * 这个 bug 只在「图不在本地 + 配了远程源」这一档才现形 ——
+       * 也就是**摘掉媒体之后才会出现**，所以必须在摘之前验。
+       */
+      const stem = fileName.replace(/\.[^.]+$/, '')
+      const tries = RASTER_EXT.some((x) => x === fileName.toLowerCase())
+        ? [fileName]
+        : [fileName, ...RASTER_EXT.map((x) => stem + x).filter((x) => x !== fileName)]
+      let lastWhy = ''
+      for (const nm of tries) {
+        const url = mediaRemoteUrl(base, chapter, nm)
+        if (!url) return false
+        /**
+         * ⚠️ 用**分段可续**的取回，不是裸 fetch。
+         *
+         * 课件图里混着一张 7.3 MB 的（其余大多几十 KB），实测「一次请求拉完」
+         * 在本机这条链路上对它稳定失败（超时 / ECONNRESET），而分段拉秒级成功 ——
+         * 失败的不是"文件太大"，是"一个连接活不了那么久"。
+         * 对学生的意义更直接：断网时只重拉断掉那一段，而不是整份重来。
+         * 判据与实现见 src/media.js 的 fetchMediaResumable。
+         */
+        const got = await fetchMediaResumable(url, { tries: 3, timeout: 45000 })
+        if (!got.ok) { lastWhy = '取远程媒体失败：' + got.why + '　' + url; continue }
+        const buf = got.buf
+        const judged = looksLikeMedia(nm, got.contentType || '')
+        if (!judged.ok) { lastWhy = judged.why + '　' + url; continue }
+        // 先回给客户端，再谈缓存 —— 让用户等的是「拿到图」，
+        // 而不是「图 + 一次磁盘写」。缓存失败不影响这一次显示。
+        res.statusCode = 200
+        res.setHeader('Content-Type', contentTypeOf(nm))
+        res.setHeader('Cache-Control', 'public, max-age=3600')
+        // 让客户端/诊断能看出「这张是从远程来的」——排查时第一眼要能分清
+        res.setHeader('X-CIP-Media', 'remote')
+        res.end(buf)
+        cache.mediaOk = true
+        cache.mediaRemoteHits = (cache.mediaRemoteHits || 0) + 1
+        cache.mediaError = ''
+        try {
+          // 缓存**按实际取到的名字**存：下次本地那一档会用同一个名字找到它
+          const p = mediaCachePath(mediaCacheRootAbs(), chapter, nm)
+          fs.mkdirSync(path.dirname(p), { recursive: true })
+          fs.writeFileSync(p, buf)
+          cache.mediaCached = (cache.mediaCached || 0) + 1
+        } catch (e) {
+          // 写不进缓存**不算失败**：这一次图已经给出来了，只是下次还要再取一遍。
+          cache.mediaError = '媒体缓存没写成：' + oneLine(e && e.message)
+        }
+        return true
       }
-      if (!r.ok) {
-        cache.mediaError = '取远程媒体失败：HTTP ' + r.status + '　' + url
-        return false
-      }
-      const ct = r.headers.get('content-type') || ''
-      const judged = looksLikeMedia(fileName, ct)
-      if (!judged.ok) { cache.mediaError = judged.why + '　' + url; return false }
-      let buf
-      try { buf = Buffer.from(await r.arrayBuffer()) } catch (e) {
-        cache.mediaError = '读远程媒体失败：' + oneLine(e && e.message); return false
-      }
-      // 先回给客户端，再谈缓存 —— 让用户等的是「拿到图」，
-      // 而不是「图 + 一次磁盘写」。缓存失败不影响这一次显示。
-      res.statusCode = 200
-      res.setHeader('Content-Type', contentTypeOf(fileName))
-      res.setHeader('Cache-Control', 'public, max-age=3600')
-      // 让客户端/诊断能看出「这张是从远程来的」——排查时第一眼要能分清
-      res.setHeader('X-CIP-Media', 'remote')
-      res.end(buf)
-      cache.mediaOk = true
-      cache.mediaRemoteHits = (cache.mediaRemoteHits || 0) + 1
-      cache.mediaError = ''
-      try {
-        const p = mediaCachePath(mediaCacheRootAbs(), chapter, fileName)
-        fs.mkdirSync(path.dirname(p), { recursive: true })
-        fs.writeFileSync(p, buf)
-        cache.mediaCached = (cache.mediaCached || 0) + 1
-      } catch (e) {
-        // 写不进缓存**不算失败**：这一次图已经给出来了，只是下次还要再取一遍。
-        cache.mediaError = '媒体缓存没写成：' + oneLine(e && e.message)
-      }
-      return true
+      if (lastWhy) cache.mediaError = lastWhy
+      return false
     }
 
     reg({ kind: 'prefix', path: P.media, handler: async (req, res) => {
@@ -1893,11 +1908,25 @@ export function createCore(ctx, opts) {
       //    断网就坏）。是 verify-media-fallback.mjs 里那条「第二次不再发远程请求」
       //    的断言把它抓出来的，那一条的判据是**远程请求计数为 0** ——
       //    只断言「第二次也能拿到图」是假绿，因为走远程同样能拿到。
+      //
+      // ⚠️ 而且缓存查找**也要换扩展名**：缓存是按「实际取到的名字」存的
+      //    （远程那份是 .webp，而 json 里写的是 .png）。
+      //    只按原名找会每次都 miss —— 第二次仍然要联网，只是慢得不明显。
+      //    实机探针（.tmp-probe-slim）第二次请求走了远程，就是这么发现的。
       if (!fs.existsSync(full) && MEDIA_BASE) {
-        try {
-          const cached = mediaCachePath(mediaCacheRootAbs(), segs[0], useName)
-          if (fs.existsSync(cached)) { full = cached; cache.mediaCacheHits = (cache.mediaCacheHits || 0) + 1 }
-        } catch (e) { /* 段名不安全时本来就走不到这里（上面已校验），忽略 */ }
+        const stem = useName.replace(/\.[^.]+$/, '')
+        const tryNames = [useName].concat(RASTER_EXT.map((x) => stem + x).filter((x) => x !== useName))
+        for (const nm of tryNames) {
+          try {
+            const cached = mediaCachePath(mediaCacheRootAbs(), segs[0], nm)
+            if (fs.existsSync(cached)) {
+              full = cached; useName = nm
+              cache.mediaCacheHits = (cache.mediaCacheHits || 0) + 1
+              res.setHeader('X-CIP-Media', 'cache')
+              break
+            }
+          } catch (e) { /* 段名不安全时本来就走不到这里（上面已校验），忽略 */ }
+        }
       }
       if (!fs.existsSync(full)) {
         if (await remoteTo(segs[0], useName, res)) return
@@ -1910,8 +1939,11 @@ export function createCore(ctx, opts) {
         res.statusCode = 200
         res.setHeader('Content-Type', contentTypeOf(useName))
         res.setHeader('Cache-Control', 'public, max-age=3600')
-        // 与远程那一档用同一个头：诊断时能一眼分清「这张是本机就有的」还是「取回来的」
-        res.setHeader('X-CIP-Media', full === path.join(dirAbs, useName) ? 'local' : 'cache')
+        // 与远程那一档用同一个头：诊断时能一眼分清「这张是本机就有的」还是「取回来的」。
+        // 缓存命中时上面已经设过 'cache' 了（它是"取回来的、已落盘"），不要覆盖掉。
+        if (!res.getHeader || !res.getHeader('X-CIP-Media')) {
+          res.setHeader('X-CIP-Media', full === path.join(dirAbs, useName) ? 'local' : 'cache')
+        }
         res.end(bytes)
       } catch (error) {
         cache.mediaError = '读图失败 ' + oneLine(segs[0] + '/' + segs[1]) + '：' + oneLine(error && error.message)
