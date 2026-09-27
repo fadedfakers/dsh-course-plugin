@@ -445,7 +445,66 @@ window.__ModuleLoader__.load({
           + '他们的客户端下次拉取仓库时同步。'))
     }
 
-    // ── 发布：版本信息 ──
+    // ── 发布：资料清单（老师视角）──
+    /**
+     * 老师在发布页要看的那一份「资料清单」。
+     *
+     * 为什么它必须在这一页：资料清单是**唯一由老师自己维护**、又直接决定
+     * 学生看到什么的东西（`资料.json` 在工作区根目录）。而它出错的样子全是静默的：
+     *   · 清单里某一项路径写错 → 学生那边少一项，老师本机毫无异常
+     *   · 引用的文件不在仓里 → 学生点开 404
+     *   · 只列了 pptx 没转 PDF → 学生能下载但**在线看不了**（浏览器没有 pptx 渲染器）
+     * 所以这一块把这三件事分别标出来，而不是只报个数。
+     */
+    function TeacherMaterials({ st, onReload }) {
+      const m = st.materials
+      if (!m) {
+        return h('div', { className: 'kcb' },
+          h('div', { className: 'k64' }, '③c 资料（学生能下载 / 在线看的东西）'),
+          h('div', { className: 'k21' }, '正在读资料清单…'))
+      }
+      const items = m.items || []
+      const broken = items.filter((x) => !x.ok)
+      const online = items.filter((x) => x.kind === 'pdf' && !x.remote)
+      return h('div', { className: 'kcb' },
+        h('div', { className: 'k64' }, '③c 资料（学生能下载 / 在线看的东西）'),
+        h('div', { className: 'kd1' }, '这份清单在工作区根目录的 **资料.json**，面板的「资料」页按它渲染。'
+          + '课件原件（pptx）浏览器打不开，所以要配一份转好的 PDF —— 跑 '
+          + '`node tools/make-materials.mjs --convert` 会自动转并刷新清单。'),
+        !m.hasManifest
+          ? h('div', { className: 'k57' }, '还没有 资料.json —— 学生那边的「资料」页会是空的（课件图不受影响，仍在「课件」页）。')
+          : h('div', { className: 'kc8' },
+            bdg('共 ' + m.count + ' 项', 'var(--dsw-alias-bg-layer-1)'),
+            bdg('能在线看 ' + online.length + ' 份', online.length ? 'var(--dsw-alias-state-success-primary)' : 'var(--dsw-alias-state-warn-primary)'),
+            h('span', { className: 'k54' }),
+            h('button', { className: 'k42', onClick: () => onReload() }, '重新读一次')),
+        // 在线预览那一栏是空的时候要说清后果：学生能下载、但**看不了**
+        m.hasManifest && !online.length
+          ? h('div', { className: 'k57', style: { color: 'var(--dsw-alias-state-warn-primary)' } },
+            '⚠ 清单里没有任何 PDF 项 —— 学生只能下载 pptx，而**浏览器看不了 pptx**，'
+            + '「在线看原件」这条会落空。跑一次 make-materials.mjs --convert 就有 PDF 了。')
+          : null,
+        broken.length
+          ? h('div', { className: 'k57', style: { color: 'var(--dsw-alias-state-error-primary)' } },
+            '⚠ ' + broken.length + ' 项引用的文件不在仓里（学生点开会 404）：'
+            + broken.slice(0, 5).map((x) => x.title + '（' + x.target + '）').join('；'))
+          : null,
+        (m.bad && m.bad.length)
+          ? h('div', { className: 'k57', style: { color: 'var(--dsw-alias-state-error-primary)' } },
+            '⚠ 清单里有 ' + m.bad.length + ' 项读不出来：' + m.bad.slice(0, 3).join('；'))
+          : null,
+        items.length
+          ? h('div', null, items.slice(0, 12).map((x, i) => h('div', { key: i, className: 'kc8' },
+            bdg(x.kind === 'slides' ? '原件' : x.kind, 'var(--dsw-alias-bg-layer-1)'),
+            h('span', { className: 'k57' }, x.title),
+            x.sizeText ? h('span', { className: 'k57' }, x.sizeText) : null,
+            h('span', { className: 'k57' }, x.remote ? '外部直链' : (x.ok ? '仓内' : '⚠ 文件不在')))))
+          : null,
+        items.length > 12 ? h('div', { className: 'k57' }, '…还有 ' + (items.length - 12) + ' 项') : null,
+        m.readError ? h('div', { className: 'k57' }, m.readError) : null)
+    }
+
+
     /**
      * 版本卡（老师的决定：**教师端要有版本控制信息**，让学生克隆到正确的版本）。
      *
@@ -565,7 +624,7 @@ window.__ModuleLoader__.load({
      *
      * 每一块各自套一个错误边界：一块崩了不该让整页红屏（学生端踩过这个坑）。
      */
-    function Publish({ st, set, onRefresh, onPublish, onPlan, onRepoStatus, onRepoInit, onLoadVersion, onCompareVersion }) {
+    function Publish({ st, set, onRefresh, onPublish, onPlan, onRepoStatus, onRepoInit, onLoadVersion, onCompareVersion, onLoadMaterials }) {
       const s = st.staged
       return h('div', { className: 'k46' },
         h('div', { className: 'k64' }, '归档与发布'),
@@ -580,6 +639,7 @@ window.__ModuleLoader__.load({
         // 数据也来自独立动作（version.info）—— 不许并进 repo.status，
         // 那个动作是纯读盘的，而版本比对要联网（上一轮为此打红过验收）。
         h(PanelBoundary, { label: '版本' }, h(VersionCard, { st, onLoadVersion, onCompareVersion })),
+        h(PanelBoundary, { label: '资料清单' }, h(TeacherMaterials, { st, onReload: onLoadMaterials })),
         h('div', { className: 'k64' }, '④ 材料归位'),
         h(PanelBoundary, { label: '材料归位' }, h(MaterialsTable, { st, set, onPlan })),
         h('div', { className: 'k64' }, '⑤ 待发布清单'),
@@ -1663,6 +1723,106 @@ window.__ModuleLoader__.load({
           : null)
     }
 
+    // ── 资料页（课件原件 / 讲义 PDF / 数据集）──
+    /**
+     * 老师那句「课件、ppt、资料放哪，学生从哪连」的学生侧答案。
+     *
+     * 每一项给学生**三个**入口，而不是一个"下载"：
+     *   · 在线看原件 —— pdf 用 `<iframe>`（浏览器自带阅读器），图片/视频直接显示
+     *   · 去课件页框选 —— **这条才是这个插件的核心动作**：跳到课件页那一章，
+     *     学生就能框选一块 PPT 图区、就地提问（老师原话：「学生端需要对照 ppt 截图提问」）
+     *   · 下载 —— 目标可能是仓内相对路径（随课程包 clone 下来），也可能是
+     *     Releases / 对象存储的 http 直链
+     *
+     * ⚠️ 为什么"预览"要分几种模式（iframe / img / video / slides）：
+     *    浏览器**没有 pptx 渲染器**。所以 pptx 那一档不能假装能内嵌 ——
+     *    要么用同目录转好的 PDF（清单里 `slides.pdf`），要么引导去课件页框选。
+     *    给一个点了没反应的「预览」按钮，比不给更糟。
+     *
+     * ⚠️ 这一层只用宿主算好的三个字段：`it.preview.mode` / `it.jump` / `it.ok`，
+     *    **不自己按扩展名推断**。判据在 core/src/resources.js（唯一来源）——
+     *    两处各推一份必然漂移，这个项目已经吃过几次（file 双前缀、路径归属）。
+     */
+    function MaterialCard({ it, st, set, onJump, matPrefix }) {
+      const pv = it.preview || { mode: 'none', src: '' }
+      const open = st.matOpen && st.matOpen.title === it.title
+      const kindLabel = it.kind === 'slides' ? '课件原件'
+        : (it.kind === 'pdf' ? 'PDF' : (it.kind === 'image' ? '图片' : (it.kind === 'video' ? '视频' : '文件')))
+      const href = it.remote ? it.target : (matPrefix + '/' + encodeURI(it.target))
+      return h('div', { className: 'kc7', 'data-ok': it.ok ? '1' : '0' },
+        h('div', { className: 'kc8' },
+          bdg(kindLabel, 'var(--dsw-alias-bg-layer-1)'),
+          h('span', { className: 'k57', style: { fontWeight: 600, color: 'var(--text)' } }, it.title),
+          it.sizeText ? h('span', { className: 'k57' }, it.sizeText) : null,
+          it.remote ? h('span', { className: 'k57' }, '（外部直链）') : null,
+          // 仓里没有这个文件时**明说**，而不是给一个点开 404 的按钮。
+          // 这是最容易让老师困惑的一档：他明明写了清单，学生却点不动。
+          !it.ok ? h('span', { className: 'k57', style: { color: 'var(--dsw-alias-state-warn-primary)' } },
+            '⚠ ' + (it.missingWhy || '仓里没有这个文件')) : null),
+        it.note ? h('div', { className: 'k57' }, it.note) : null,
+        h('div', { className: 'kca' },
+          it.ok && pv.mode !== 'none' && pv.mode !== 'slides'
+            ? h('button', {
+              className: 'k42 k11',
+              onClick: () => set({ matOpen: open ? null : { title: it.title, mode: pv.mode, src: pv.src } }),
+            }, open ? '收起预览' : '在线看原件')
+            : null,
+          it.jump ? h('button', {
+            className: 'k42',
+            disabled: !it.ok,
+            title: '跳到课件页的「' + it.jump.chapter + '」，在那里可以框选一块图区提问',
+            onClick: () => onJump(it.jump),
+          }, '去课件页框选提问') : null,
+          it.ok ? h('a', {
+            className: 'k42', href, target: '_blank', rel: 'noreferrer',
+            style: {
+              textDecoration: 'none', display: 'inline-flex', alignItems: 'center',
+              padding: '4px 10px', borderRadius: '5px', border: '1px solid var(--line-2)',
+              fontSize: '12px', color: 'var(--text)',
+            },
+          }, '下载') : null),
+        open && pv.mode === 'iframe'
+          ? h('div', null,
+            h('iframe', {
+              src: pv.src, title: it.title,
+              style: { width: '100%', height: '460px', border: '1px solid var(--line)', borderRadius: 'var(--r1)', background: '#fff' },
+            }),
+            h('div', { className: 'k57' }, '翻到想看的那一页，截图或框选之后回到课件页提问。'))
+          : null,
+        open && pv.mode === 'img'
+          ? h('img', {
+            src: pv.src, alt: it.title,
+            style: { maxWidth: '100%', border: '1px solid var(--line)', borderRadius: 'var(--r1)' },
+          })
+          : null,
+        open && pv.mode === 'video'
+          ? h('video', { src: pv.src, controls: true, style: { width: '100%', maxHeight: '420px', background: '#000', borderRadius: 'var(--r1)' } })
+          : null)
+    }
+
+    function Materials({ st, set, onJump, matPrefix }) {
+      const m = st.materials
+      if (!m) return h('div', { className: 'k21' }, '资料清单加载中…')
+      if (m.readError) return h('div', { className: 'k52 k53', style: { margin: '8px 14px 0' } }, m.readError)
+      if (!m.items || !m.items.length) {
+        return h('div', { className: 'k46' },
+          h('div', { className: 'k64' }, '资料'),
+          h('div', { className: 'kd1' }, '老师还没有发布课件原件 / 讲义。'),
+          h('div', { className: 'k57' }, '课件图仍然可以在「课件」页看；这一页只放**原件**（能下载、能在线看的那种）。'))
+      }
+      return h('div', { className: 'k46' },
+        h('div', { className: 'k64' }, '资料（' + m.count + ' 项）'),
+        h('div', { className: 'kd1' }, '课件原件、讲义 PDF 都在这儿。**要对着某一页提问**，'
+          + '点「去课件页框选提问」—— 那里能框一块图区就地提问，比截图发群里清楚得多。'),
+        // 坏项单列：某项从清单里静默消失是最难查的一类（老师会说"我明明写了"）
+        (m.bad && m.bad.length)
+          ? h('div', { className: 'k57', style: { color: 'var(--dsw-alias-state-warn-primary)' } },
+            '⚠ 清单里有 ' + m.bad.length + ' 项没法显示：' + m.bad.slice(0, 3).join('；'))
+          : null,
+        (m.items || []).map((it, i) => h(MaterialCard, { key: 'mat' + i, it, st, set, onJump, matPrefix })),
+        m.updated ? h('div', { className: 'k57' }, '清单更新于 ' + m.updated) : null)
+    }
+
     // ── 面板 ──
     function Panel() {
       const init = {
@@ -1698,6 +1858,9 @@ window.__ModuleLoader__.load({
         // 版本卡（发布页）：version.info 的返回。
         // 初值 null = 还没读，卡上说的是「正在读版本信息…」而不是显示 undefined。
         versionInfo: null,
+        // 资料页：materials = materials.list 的返回；matOpen = 哪一项的预览展开了
+        // （存 `{title, mode, src}` 而不是下标 —— 清单会刷新，下标会漂）
+        materials: null, matOpen: null,
       }
       const pair = React.useState(init)
       const st = pair[0] || init
@@ -2196,6 +2359,25 @@ window.__ModuleLoader__.load({
         }
       }, [])
       const onCompareVersion = React.useCallback(async () => { await loadVersion(true) }, [loadVersion])
+      /**
+       * 资料清单（发布页要看的那一份）。
+       *
+       * 老师在这一页真正想知道的是「学生那边能看到什么」——
+       * 而资料清单是唯一由**老师自己维护**、又直接决定学生看到什么的东西。
+       * 所以这里不只要列出来，还要把**两类问题**摆明：
+       *   · `bad`：清单里写了但读不出来的项（路径错、缺 title…）
+       *   · `ok:false`：清单引用了一个仓里不存在的文件
+       * 这两种都表现为"学生那边少一项"，而老师本机看不出任何异常。
+       */
+      const loadMaterials = React.useCallback(async () => {
+        try {
+          const r = await api('materials.list', {})
+          set({ materials: r })
+        } catch (err) {
+          // 同 loadRepo：新动作，旧宿主上没有它 —— 走 notice 不走 error
+          set({ materials: null, notice: '「归档发布」里的资料清单暂时读不到（多半是宿主半区没重启），其余功能不受影响。' })
+        }
+      }, [])
       const onBatch = React.useCallback(async (paths, decision) => {
         set({ busy: true, error: '' })
         try {
@@ -2223,6 +2405,8 @@ window.__ModuleLoader__.load({
       // 版本信息同理，但**不带 remote**：这一趟不 spawn git、不联网，
       // 所以「打开这一页就看得到本机是哪个版本」是免费的；比对远端留给按钮。
       React.useEffect(() => { if (st.view === 'publish' && !stRef.current.versionInfo) loadVersion(false) }, [st.view, loadVersion])
+      // 资料清单：切到「归档发布」时读一次（读的是一个 json，很便宜）
+      React.useEffect(() => { if (st.view === 'publish' && !stRef.current.materials) loadMaterials() }, [st.view, loadMaterials])
 
       const views = [
         { id: 'questions', label: '提问与审计' },
@@ -2327,6 +2511,8 @@ window.__ModuleLoader__.load({
                 onRepoStatus: loadRepo, onRepoInit,
                 // 版本卡的两个动作：读本机版本（不起子进程）、比对远端（联网，只有按钮会走）
                 onLoadVersion: loadVersion, onCompareVersion,
+                // 资料清单：发布页那一块"学生能下载/在线看什么"
+                onLoadMaterials: loadMaterials,
               })) : null,
             // 每个视图各自一个错误边界：一个视图崩了不该把整页变成红屏
             // （学生端踩过：一个视图调错函数，整块面板全红）。

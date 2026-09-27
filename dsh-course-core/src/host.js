@@ -45,6 +45,9 @@ import {
 // 媒体的取用策略（本地优先 → 远程回退 → 落缓存）。纯函数放这里，
 // 真正的 fetch / 写盘在 createCore 的 registerMedia 里。
 import { validateMediaBase, mediaRemoteUrl, mediaCachePath, looksLikeMedia, contentTypeOf, fetchMediaResumable } from './media.js'
+// 「资料」清单：课件原件 / 讲义 PDF / 数据集怎么给学生（读清单、判类型、定预览方式）。
+// 见 resources.js 顶部的长注释 —— 它回答的是老师那句「资料放哪、学生从哪连」。
+import { normalizeManifest, previewTarget, slidesJump, sizeText, MATERIAL_KINDS } from './resources.js'
 // 起子进程并**收回输出**（git / 发布工具）。用它而不是 spawnSync 的 encoding：
 // 沙箱不给管道，带 encoding 的 spawnSync 一律 EPERM 且不抛异常。
 import { runCaptured, runOutput, runExitCode } from './run.js'
@@ -122,7 +125,7 @@ export const COURSE_HOME_DIR = '课程'
  * 结构索引是共享内容，必须留在根目录，不能一刀切）。
  * 新增私有数据目录时记得加进来 —— 加漏的症状就是上面那种「静默混课」。
  */
-export const PRIVATE_RELS = ['课程问题池', '作业提交', '教案草稿', '课程配置.json', '学生名册.json', '我的身份.json']
+export const PRIVATE_RELS = ['课程问题池', '作业提交', '教案草稿', '课程配置.json', '学生名册.json', '我的身份.json', '资料.json', '资料']
 
 /**
  * 一个目录「像不像课程工作区」。
@@ -430,6 +433,21 @@ export function readCourseConfig(dirs) {
 export const PUBLIC_ITEMS_REL = '课程问题池\\公共'
 export const STUDENT_ITEMS_REL = '课程问题池\\学生'
 export const SUBMIT_ROOT_REL = '作业提交'
+
+/**
+ * 「资料」：课件原件 / 讲义 PDF / 数据集 / 代码包。
+ *
+ * 两条约定，都很硬：
+ *   · **清单是 `资料.json`**（工作区根目录）—— 老师维护它，面板读它渲染"资料"页
+ *   · **仓内文件放 `资料/`** —— 清单里 `file` 是相对它（或 `资料/` 下的）路径
+ * 文件**不在这里**的（原始 pptx、视频、数据集）就写 `url` 指向 Releases / 对象存储。
+ *
+ * 为什么清单要放在**工作区根目录**而不是 `课程中心/` 下：后者是"全校共享内容"
+ * （课件、索引），而资料是**这门课**的东西 —— 与 课程配置.json / 教案/ 同一个层级。
+ * 放错地方的症状是"多课程布局下 A 班的资料出现在 B 班"，而且不报错。
+ */
+export const MATERIALS_REL = '资料.json'
+export const MATERIALS_DIR = '资料'
 
 export const SECTION_ORDER = ['原始提问', '现象', '初步判断', 'AI 答复', '处理结论', '复盘', '问题总结', '教师归档']
 export const THREAD_TITLE = '追问记录'
@@ -843,6 +861,15 @@ export function createCore(ctx, opts) {
     sub: prefix + '-sub', shot: prefix + '-shot',
     // 诊断页走独立前缀：与 .css 那个前缀不重叠，避免前缀路由二义
     diag: prefix + '-diag',
+    /**
+     * 「资料」里那些仓内文件（转好的 PDF、讲义、数据集小样）。
+     *
+     * 为什么不复用 `-media`：那条路由的取值域被钉死在「章节/文件名」两段，
+     * 且只认课件目录与三章白名单（见 registerMedia 的校验）——那是它该有的样子，
+     * 硬塞进资料路径只会让它长出两种语义。与 registerSubmissions 不复用 media
+     * 是同一个理由，写在那边注释里。
+     */
+    mat: prefix + '-mat',
   }
   if (!cache.mediaOk && ctx.webServer !== undefined) cache.mediaOk = true
   if (!cache.mediaOk) cache.mediaError = 'webServer 不可用'
@@ -1270,11 +1297,74 @@ export function createCore(ctx, opts) {
     try { return fs.existsSync(WORKSPACE) ? WORKSPACE : os.homedir() } catch (e) { return undefined }
   }
 
-  /** 向导的动作集合。各插件在自己的 handlers 里 `...core.setupHandlers` 合并进去。 */
-  const setupHandlers = {
+  /** 向导的动作集合。各插件在自己的 handlers 里 `...core.coreHandlers` 合并进去。 */
+  const coreHandlers = {
     'setup.info': async () => setupState(),
     'setup.clone': async (args) => setupClone(args && typeof args === 'object' ? args : {}),
     'setup.use': async (args) => setupUse(args && typeof args === 'object' ? args : {}),
+    // 「资料」页的数据源。与 setup.* 放在一起的理由一样：
+    // 它是**两端都要有**的内核能力（学生要下载、老师要核对清单），
+    // 让两个插件各自展开同一份，就不存在"一端加了另一端忘了"。
+    'materials.list': async () => materialsState(),
+  }
+
+  // ── 资料（课件原件 / 讲义 PDF / 数据集）─────────────────────────────
+  /**
+   * 读 `资料.json`，把它变成界面能直接渲染的东西。
+   *
+   * 三件事在这里定好，界面不再自己判断（判断散成三处必然漂移）：
+   *   ① **本地文件的实际大小**：清单里的 size 是老师（或生成器）填的，
+   *      而文件可能后来被换过。以磁盘为准，清单那个只作远程项的参考。
+   *   ② **本地那一项到底存不存在**：不存在时界面要能说出来（"这一项指向的文件不在仓里"），
+   *      而不是给一个点了 404 的下载按钮。这是最容易让老师困惑的一档 ——
+   *      他明明写了清单，学生却点不动。
+   *   ③ **预览方式**：`previewTarget()` 决定用 iframe / img / video / 还是"去课件页"。
+   */
+  async function materialsState() {
+    let raw = null
+    let readError = ''
+    try {
+      if (fs.existsSync(abs(MATERIALS_REL))) raw = JSON.parse(readText(MATERIALS_REL))
+    } catch (e) {
+      // 清单坏了不能把面板弄挂（同 readCourseConfig 的口径）：给空清单 + 一句原因
+      readError = '资料.json 读不动：' + oneLine(e && e.message)
+    }
+    const norm = normalizeManifest(raw || {})
+    const items = norm.items.map((it) => {
+      const localAbs = it.remote ? '' : abs(it.target)
+      let exists = false
+      let size = it.size
+      try {
+        if (localAbs && fs.existsSync(localAbs)) {
+          exists = true
+          const st = fs.statSync(localAbs)
+          if (st.isFile()) size = st.size
+        }
+      } catch (e) { /* 读不到就当不存在 */ }
+      const pv = previewTarget(it)
+      const jump = slidesJump(it)
+      return Object.assign({}, it, {
+        size,
+        sizeText: sizeText(size),
+        /** 仓内文件是否真的在（远程项一律 true —— 它的可达性由学生那边的网络决定） */
+        ok: it.remote || exists,
+        missingWhy: (it.remote || exists) ? '' : ('仓里没有这个文件：' + it.target),
+        preview: pv,
+        jump,
+      })
+    })
+    return {
+      ok: true,
+      hasManifest: !!raw || norm.items.length > 0,
+      updated: norm.updated,
+      note: norm.note,
+      readError,
+      /** 坏项单列：某项从清单里静默消失是最难查的一类（见 resources.js 的注释） */
+      bad: norm.bad,
+      items,
+      count: items.length,
+      kinds: MATERIAL_KINDS,
+    }
   }
 
   async function loadIndex() {
@@ -1953,6 +2043,70 @@ export function createCore(ctx, opts) {
   }
 
   /**
+   * 「资料」的仓内文件路由（`<prefix>-mat/<相对路径>`）。
+   *
+   * 为什么不复用 `-media`：那条被钉死在「章节/文件名」两段 + 三章白名单，
+   * 而资料是任意相对路径（`第一章-原件.pdf`、`讲义/第3讲.pdf`…）。
+   * 硬塞进去只会让那条路由长出两种语义 —— 与下面 registerSubmissions
+   * 不复用 media 是同一个理由。
+   *
+   * 安全判据与 registerSubmissions 完全一致（**不能只查 `..` 子串**，
+   * Windows 上 `%5C`、盘符、`....//` 都能绕过朴素检查）：
+   *   ① 解码后必须是相对路径、不含 `..`、不是绝对路径
+   *   ② `path.resolve` 之后必须真的落在 `资料/` 里
+   * 两道都要 —— 这一条读的是磁盘上的任意文件，判错就是任意文件读取。
+   */
+  function registerMaterials() {
+    const rootRel = MATERIALS_DIR
+    reg({ kind: 'prefix', path: P.mat, handler: (req, res) => {
+      let nm = ''
+      try {
+        let rel = String(req.url || '')
+        if (rel.indexOf(P.mat) === 0) rel = rel.slice(P.mat.length)
+        if (rel[0] === '/') rel = rel.slice(1)
+        const qi = rel.indexOf('?'); if (qi >= 0) rel = rel.slice(0, qi)
+        nm = decodeURIComponent(rel)
+      } catch (e) { nm = '' }
+      nm = nm.replace(/\\/g, '/')
+      const rootAbs = path.resolve(abs(rootRel))
+      let full = ''
+      try {
+        full = path.resolve(rootAbs, nm)
+      } catch (e) { full = '' }
+      const withSep = rootAbs.endsWith(path.sep) ? rootAbs : rootAbs + path.sep
+      /**
+       * ⚠️ 四道判据，**缺一不可**（这一条读的是磁盘上的真实文件，判松一格就是任意文件读取）：
+       *   ① 空名字
+       *   ② 含 `..`
+       *   ③ 以 `/` 开头（绝对路径）
+       *   ④ 形如 `C:` 的盘符 —— **这一条是负向用例验出来的**：
+       *      把判据削成只剩「不含 .. 子串」之后，`C%3A%5CWindows%5Cwin.ini`
+       *      那条断言当场变红（HTTP 200，读到了系统文件）。
+       * 再叠一道 `path.resolve` 兜底：解析结果必须真的落在 `资料/` 里。
+       */
+      const bad = !nm || nm.indexOf('..') >= 0 || nm[0] === '/' || /^[A-Za-z]:/.test(nm)
+        || !full || (full !== rootAbs && full.indexOf(withSep) !== 0)
+      if (bad) {
+        res.statusCode = 400; res.end('bad name'); return
+      }
+      try {
+        const st = fs.statSync(full)
+        if (!st.isFile()) { res.statusCode = 404; res.end('not found'); return }
+        const bytes = fs.readFileSync(full)
+        res.statusCode = 200
+        // PDF 内嵌预览要求正确的 Content-Type，否则浏览器会当成下载而不是显示
+        res.setHeader('Content-Type', contentTypeOf(full))
+        res.setHeader('Content-Length', String(bytes.length))
+        // 资料基本不变，可以放心让浏览器缓存久一点（省得每次翻页都重下 4 MB 的 PDF）
+        res.setHeader('Cache-Control', 'public, max-age=86400')
+        res.end(bytes)
+      } catch (error) {
+        res.statusCode = 404; res.end('not found')
+      }
+    } })
+  }
+
+  /**
    * 提交附件与提问截图的服务路由。
    *
    * 为什么不复用 registerMedia：那个路由的取值域被钉死在「章节/文件名」两段，
@@ -2224,7 +2378,7 @@ export function createCore(ctx, opts) {
 
   /** ctx.effect 包装注册，保证卸载时路由跟着撤掉 */
   function mount() {
-    registerStatic(); registerMedia(); registerSubmissions(); registerDiag()
+    registerStatic(); registerMedia(); registerMaterials(); registerSubmissions(); registerDiag()
     for (const r of routes) ctx.effect(() => ctx.webServer.register(r), label + ' ' + r.path)
   }
 
@@ -2259,17 +2413,17 @@ export function createCore(ctx, opts) {
     // 单一事实来源仍是磁盘原始文件，条目按来源 mtime+size 失效。
     cached, statOf, sameStat, clearCache, cacheInfo, cacheDir,
     // 路由
-    registerApi, registerStatic, registerMedia, registerSubmissions, mount, routes, readBodyForTest: null,
+    registerApi, registerStatic, registerMedia, registerMaterials, registerSubmissions, mount, routes, readBodyForTest: null,
     // ── 首次启动向导 ──────────────────────────────────────────────
     //
-    // 为什么是**另一个键**（setupHandlers）而不是并进各插件的 handlers 里：
+    // 为什么是**另一个键**（coreHandlers）而不是并进各插件的 handlers 里：
     // 向导是「内核的能力」，学生端与教师端都要有（学生换台机器、老师换台机器
     // 是同一件事），而两端的 handlers 是各写各的。给一个现成的对象让它们展开，
     // 就不存在「一端加了、另一端忘了」这种半成品状态。
     //
-    // ⚠️ 各插件必须以 `...core.setupHandlers` 的形式合并进去才会真的挂上路由
+    // ⚠️ 各插件必须以 `...core.coreHandlers` 的形式合并进去才会真的挂上路由
     //    （有断言守着，见 verify-setup-wizard.mjs）。
-    setupHandlers,
+    coreHandlers,
     setupState,
     // 诊断
     info: () => {
@@ -2348,7 +2502,7 @@ export function createCore(ctx, opts) {
       // 供客户端拼附件 URL：提交附件与提问截图各有自己的前缀。
       // 绝不在这里写死 '/cip-stu-sub' —— 学生端与教师端前缀不同，
       // 写死就会让教师端去请求学生端的路由（这个坑在客户端那侧已经踩过一次）。
-      prefixes: { api: P.api, media: P.media, katex: P.katex, css: P.css, sub: P.sub, shot: P.shot },
+      prefixes: { api: P.api, media: P.media, katex: P.katex, css: P.css, sub: P.sub, shot: P.shot, mat: P.mat },
       routes: routes.map((r) => r.path),
     }
     },

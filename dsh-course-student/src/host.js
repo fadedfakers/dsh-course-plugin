@@ -312,7 +312,7 @@ export async function apply(ctx) {
     // 这里只是把它们挂到自己的 API 前缀上。
     // ⚠️ 漏了这一行的症状：面板提示「去配工作区」，而向导调的动作返回「未知动作」——
     //    看起来像宿主没重启，其实是这套动作压根没注册。有断言守着。
-    ...core.setupHandlers,
+    ...core.coreHandlers,
     async info() {
       const items = await core.listItems()
       const mine = items.filter((i) => i.student === STUDENT || i.scope === 'legacy')

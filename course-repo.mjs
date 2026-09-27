@@ -294,6 +294,8 @@ function collectCourseData(manifest) {
     : path.join(WORKSPACE, '.webp-out')
   const rawRoot = path.join(WORKSPACE, '课程中心', '预览数据')
   let skippedMedia = 0
+  /** 资料/ 里没被清单引用的文件（原件那类），发布时跳过并报出来 */
+  const skippedMat = []
   for (const ch of ['第一章', '第二章', '第三章']) {
     const j = path.join(rawRoot, ch + '.json')
     if (fs.existsSync(j)) out.push({ to: '课程中心/预览数据/' + ch + '.json', src: j, kind: '课程数据' })
@@ -311,6 +313,51 @@ function collectCourseData(manifest) {
     console.log('  （--no-media）课件图不随仓分发，跳过 ' + skippedMedia + ' 张 ——')
     console.log('     前提：它们已经在别处托管好，且 课程配置.json 里的 mediaBase 指向那里。')
     console.log('     摘之前请先跑 node tools/verify-media-source.mjs 逐字节核对远程那份完整。')
+  }
+  // ── 「资料」：清单 + 仓内那份文件 ──────────────────────────────────────
+  //
+  // 这是老师那句「资料放哪、学生从哪连」的落点：老师维护 资料.json（清单），
+  // 学生端面板的「资料」页按它渲染下载与在线预览。
+  // 这里发两样东西：
+  //   ① `资料.json` —— **清单本身**，没有它学生那边一个入口都没有
+  //   ② `资料/*`   —— 清单里"仓内相对路径"那些文件（我们这边是转好的 PDF）
+  // 清单里写了 `url` 的项（Releases / 对象存储）**不发文件**，只发那一行 ——
+  // 于是原 pptx 这种几十兆的二进制不必进 git（进了历史就永久背着它）。
+  const matManifest = path.join(WORKSPACE, '资料.json')
+  if (fs.existsSync(matManifest)) {
+    out.push({ to: '资料.json', src: matManifest, kind: '资料清单' })
+    const matDir = path.join(WORKSPACE, '资料')
+    if (fs.existsSync(matDir)) {
+      // 只发清单**引用到的**文件：目录里躺着的中间产物（.pptx 之类的原件）
+      // 一个都不该跟着学生 clone 下去 —— 浏览器打不开它们，只会让仓变胖。
+      let refs = []
+      try {
+        const m = JSON.parse(fs.readFileSync(matManifest, 'utf8'))
+        refs = (m.items || [])
+          .filter((it) => it && !it.url && it.file)
+          .map((it) => String(it.file).replace(/^资料\//, '').replace(/\\/g, '/'))
+          // slides 那一项也可能带一份 PDF 指针（清单里没单独列一项时）
+          .concat((m.items || []).filter((it) => it && it.slides && it.slides.pdf)
+            .map((it) => String(it.slides.pdf).replace(/^资料\//, '').replace(/\\/g, '/')))
+      } catch (e) { refs = [] }
+      const uniq = [...new Set(refs)]
+      const walkMat = (dir, rel) => {
+        for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+          const r = rel ? rel + '/' + e.name : e.name
+          if (e.isDirectory()) { walkMat(path.join(dir, e.name), r); continue }
+          if (uniq.indexOf(r) < 0) { skippedMat.push(r); continue }
+          out.push({ to: '资料/' + r, src: path.join(dir, e.name), kind: '资料' })
+        }
+      }
+      walkMat(matDir, '')
+      if (skippedMat.length) {
+        console.log('  （资料/ 里有 ' + skippedMat.length + ' 个文件不在清单里，未发布：'
+          + skippedMat.slice(0, 4).join('、') + (skippedMat.length > 4 ? ' …' : '') + '）')
+        console.log('     原件（.pptx）本来就该留在这里、不进仓 —— 要发给学生请放 Releases 并在清单里写 url。')
+      }
+    }
+  } else {
+    console.log('  （还没有 资料.json —— 想给学生发课件原件/讲义，先跑 node tools/make-materials.mjs --convert）')
   }
   return out
 }

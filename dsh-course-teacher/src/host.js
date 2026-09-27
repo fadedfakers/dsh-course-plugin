@@ -1535,7 +1535,7 @@ export async function apply(ctx) {
     // 动作本体在 dsh-course-core 里；这一行是把它挂到教师端的前缀上。
     // ⚠️ 漏了这一行的症状：发布页提示「没找到课程工作区」，而向导调的动作
     //    返回「未知动作」—— 看起来像宿主没重启。有断言守着（verify-setup-wizard.mjs）。
-    ...core.setupHandlers,
+    ...core.coreHandlers,
   }
 
   core.registerApi(handlers)

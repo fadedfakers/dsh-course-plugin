@@ -1529,6 +1529,106 @@ window.__ModuleLoader__.load({
           : null)
     }
 
+    // ── 资料页（课件原件 / 讲义 PDF / 数据集）──
+    /**
+     * 老师那句「课件、ppt、资料放哪，学生从哪连」的学生侧答案。
+     *
+     * 每一项给学生**三个**入口，而不是一个"下载"：
+     *   · 在线看原件 —— pdf 用 `<iframe>`（浏览器自带阅读器），图片/视频直接显示
+     *   · 去课件页框选 —— **这条才是这个插件的核心动作**：跳到课件页那一章，
+     *     学生就能框选一块 PPT 图区、就地提问（老师原话：「学生端需要对照 ppt 截图提问」）
+     *   · 下载 —— 目标可能是仓内相对路径（随课程包 clone 下来），也可能是
+     *     Releases / 对象存储的 http 直链
+     *
+     * ⚠️ 为什么"预览"要分几种模式（iframe / img / video / slides）：
+     *    浏览器**没有 pptx 渲染器**。所以 pptx 那一档不能假装能内嵌 ——
+     *    要么用同目录转好的 PDF（清单里 `slides.pdf`），要么引导去课件页框选。
+     *    给一个点了没反应的「预览」按钮，比不给更糟。
+     *
+     * ⚠️ 这一层只用宿主算好的三个字段：`it.preview.mode` / `it.jump` / `it.ok`，
+     *    **不自己按扩展名推断**。判据在 core/src/resources.js（唯一来源）——
+     *    两处各推一份必然漂移，这个项目已经吃过几次（file 双前缀、路径归属）。
+     */
+    function MaterialCard({ it, st, set, onJump, matPrefix }) {
+      const pv = it.preview || { mode: 'none', src: '' }
+      const open = st.matOpen && st.matOpen.title === it.title
+      const kindLabel = it.kind === 'slides' ? '课件原件'
+        : (it.kind === 'pdf' ? 'PDF' : (it.kind === 'image' ? '图片' : (it.kind === 'video' ? '视频' : '文件')))
+      const href = it.remote ? it.target : (matPrefix + '/' + encodeURI(it.target))
+      return h('div', { className: 'kc7', 'data-ok': it.ok ? '1' : '0' },
+        h('div', { className: 'kc8' },
+          bdg(kindLabel, 'var(--dsw-alias-bg-layer-1)'),
+          h('span', { className: 'k57', style: { fontWeight: 600, color: 'var(--text)' } }, it.title),
+          it.sizeText ? h('span', { className: 'k57' }, it.sizeText) : null,
+          it.remote ? h('span', { className: 'k57' }, '（外部直链）') : null,
+          // 仓里没有这个文件时**明说**，而不是给一个点开 404 的按钮。
+          // 这是最容易让老师困惑的一档：他明明写了清单，学生却点不动。
+          !it.ok ? h('span', { className: 'k57', style: { color: 'var(--dsw-alias-state-warn-primary)' } },
+            '⚠ ' + (it.missingWhy || '仓里没有这个文件')) : null),
+        it.note ? h('div', { className: 'k57' }, it.note) : null,
+        h('div', { className: 'kca' },
+          it.ok && pv.mode !== 'none' && pv.mode !== 'slides'
+            ? h('button', {
+              className: 'k42 k11',
+              onClick: () => set({ matOpen: open ? null : { title: it.title, mode: pv.mode, src: pv.src } }),
+            }, open ? '收起预览' : '在线看原件')
+            : null,
+          it.jump ? h('button', {
+            className: 'k42',
+            disabled: !it.ok,
+            title: '跳到课件页的「' + it.jump.chapter + '」，在那里可以框选一块图区提问',
+            onClick: () => onJump(it.jump),
+          }, '去课件页框选提问') : null,
+          it.ok ? h('a', {
+            className: 'k42', href, target: '_blank', rel: 'noreferrer',
+            style: {
+              textDecoration: 'none', display: 'inline-flex', alignItems: 'center',
+              padding: '4px 10px', borderRadius: '5px', border: '1px solid var(--line-2)',
+              fontSize: '12px', color: 'var(--text)',
+            },
+          }, '下载') : null),
+        open && pv.mode === 'iframe'
+          ? h('div', null,
+            h('iframe', {
+              src: pv.src, title: it.title,
+              style: { width: '100%', height: '460px', border: '1px solid var(--line)', borderRadius: 'var(--r1)', background: '#fff' },
+            }),
+            h('div', { className: 'k57' }, '翻到想看的那一页，截图或框选之后回到课件页提问。'))
+          : null,
+        open && pv.mode === 'img'
+          ? h('img', {
+            src: pv.src, alt: it.title,
+            style: { maxWidth: '100%', border: '1px solid var(--line)', borderRadius: 'var(--r1)' },
+          })
+          : null,
+        open && pv.mode === 'video'
+          ? h('video', { src: pv.src, controls: true, style: { width: '100%', maxHeight: '420px', background: '#000', borderRadius: 'var(--r1)' } })
+          : null)
+    }
+
+    function Materials({ st, set, onJump, matPrefix }) {
+      const m = st.materials
+      if (!m) return h('div', { className: 'k21' }, '资料清单加载中…')
+      if (m.readError) return h('div', { className: 'k52 k53', style: { margin: '8px 14px 0' } }, m.readError)
+      if (!m.items || !m.items.length) {
+        return h('div', { className: 'k46' },
+          h('div', { className: 'k64' }, '资料'),
+          h('div', { className: 'kd1' }, '老师还没有发布课件原件 / 讲义。'),
+          h('div', { className: 'k57' }, '课件图仍然可以在「课件」页看；这一页只放**原件**（能下载、能在线看的那种）。'))
+      }
+      return h('div', { className: 'k46' },
+        h('div', { className: 'k64' }, '资料（' + m.count + ' 项）'),
+        h('div', { className: 'kd1' }, '课件原件、讲义 PDF 都在这儿。**要对着某一页提问**，'
+          + '点「去课件页框选提问」—— 那里能框一块图区就地提问，比截图发群里清楚得多。'),
+        // 坏项单列：某项从清单里静默消失是最难查的一类（老师会说"我明明写了"）
+        (m.bad && m.bad.length)
+          ? h('div', { className: 'k57', style: { color: 'var(--dsw-alias-state-warn-primary)' } },
+            '⚠ 清单里有 ' + m.bad.length + ' 项没法显示：' + m.bad.slice(0, 3).join('；'))
+          : null,
+        (m.items || []).map((it, i) => h(MaterialCard, { key: 'mat' + i, it, st, set, onJump, matPrefix })),
+        m.updated ? h('div', { className: 'k57' }, '清单更新于 ' + m.updated) : null)
+    }
+
     // ── 面板 ──
     function Panel() {
       const init = {
@@ -1554,6 +1654,9 @@ window.__ModuleLoader__.load({
         me: null, meOpen: false, meForm: null, identifyHint: '', meConfirm: false, meMissing: '',
         // 就绪清单与首次设置向导
         readiness: null, wizardOpen: false, wizardStep: 1, wizardSkipped: false,
+        // 资料页：materials = materials.list 的返回；matOpen = 哪一项的预览展开了
+        // （存 `{title, mode, src}` 而不是下标 —— 清单会刷新，下标会漂）
+        materials: null, matOpen: null,
       }
       const pair = React.useState(init)
       const st = pair[0] || init          // 状态为 null/undefined 时也不至于崩
@@ -1633,6 +1736,11 @@ window.__ModuleLoader__.load({
         // 旧宿主上这个动作不存在，会返回「未知动作」。写在同一个 try 里，
         // 后果是整页只显示一条报错、连课件都看不了（踩过一次）。
         // 新加的动作不该有能力把已经能用的面板弄坏。
+        // 资料清单：同样是**新动作**，旧宿主上没有。单独一段 try ——
+        // 少了它只是「资料」页空着，不该影响提问/课件这些主功能（踩过一次）。
+        try {
+          set({ materials: await api('materials.list', {}) })
+        } catch (err) { /* 没资料清单也能用 */ }
         // 就绪清单：同样是**新动作**，旧宿主上不存在。
         // 单独一段 try —— 新加的动作不该有能力把已经能用的面板弄坏（踩过一次）。
         try {
@@ -1685,8 +1793,22 @@ window.__ModuleLoader__.load({
         set({ chapter: ch, slideIndex: 0, picked: [], slides: null })  // picked 永远是数组，不能给 null
         set({ slides: await api('slides', { chapter: ch }) })
       }, [])
-      const openThread = React.useCallback(async (path) => {
-        try {
+      /**
+       * 「去课件页框选提问」—— 资料页 → 课件页的那一跳。
+       *
+       * 老师原话是「学生端需要对照 ppt 截图提问」，所以这一跳必须落在一个
+       * **能立刻框选**的地方：切到课件页、换到那一章、滚到最前面。
+       * `slides.from` 只是清单给的建议范围；面板的课件页按 `<章>.json` 渲染，
+       * 所以这里**不按 from 定位页**（页序不一定一一对应，跳错页比不跳更糟）——
+       * 宁可落在那一章的第 1 页，也不假装精确。
+       */
+      const goMaterialsJump = React.useCallback(async (jump) => {
+        if (!jump || !jump.chapter) return
+        set({ view: 'slides', slideIndex: 0, picked: [], matOpen: null })
+        await switchChapter(jump.chapter)
+        set({ notice: '已切到「' + jump.chapter + '」的课件页：拖一下框选一块图区，就能就着它提问' })
+      }, [switchChapter])
+      const openThread = React.useCallback(async (path) => {        try {
           set({ thread: await api('thread', { path }), selPath: path, view: 'thread', followup: '' })
         } catch (err) { set({ error: '读取失败：' + ((err && err.message) || String(err)) }) }
       }, [])
@@ -1964,6 +2086,9 @@ window.__ModuleLoader__.load({
       const views = [
         { id: 'outline', label: '大纲' },
         { id: 'slides', label: '课件' },
+        // 「资料」放第三个：学生第一个想找的通常是"原件在哪"（老师那句
+        // 「ppt 放哪」就是学生视角的问题），而它现在终于有地方可去了。
+        { id: 'materials', label: '资料' },
         { id: 'threads', label: '我的提问' },
         { id: 'public', label: '公开问答' },
         { id: 'lesson', label: '课时作业' },
@@ -2054,8 +2179,16 @@ window.__ModuleLoader__.load({
               h('div', { className: 'k91' },
                 h(Slides, { st, set, onAddPick: addPick, pageHasPick: pageHasPick, slideRef: slideRef })),
               h(AskPanel, { st, set, onAsk: onAsk, onRemovePick: removePick, onClearPicks: clearPicks }))) : null,
-            st.view === 'threads' ? h(PanelBoundary, { label: '我的提问' }, h('div', { className: 'k27' }, h(ThreadList, { st, set, onOpen: openThread, onShare: shareItem, onShareBatch: shareBatch }))) : null,
-            st.view === 'public' ? h(PanelBoundary, { label: '公开问答' }, h('div', { className: 'k27' }, h(PublicQA, { st, set, onOpen: openThread, onSync }))) : null,
+            st.view === 'materials' ? h(PanelBoundary, { label: '资料' },
+              h(Materials, {
+                st, set, onJump: goMaterialsJump,
+                // 前缀从**宿主下发的 info.prefixes** 取，不写死：
+                // 写死会让"换前缀就整块坏掉"，而这个项目已经为写死前缀吃过一次亏
+                // （教师面板去请求学生端路由，满屏「未知动作」）。回落值只是为了
+                // 老宿主上不至于崩 —— 那种情况下这一页本来也是空的。
+                matPrefix: (st.info && st.info.prefixes && st.info.prefixes.mat) || '/cip-stu-mat',
+              })) : null,
+            st.view === 'threads' ? h(PanelBoundary, { label: '我的提问' }, h('div', { className: 'k27' }, h(ThreadList, { st, set, onOpen: openThread, onShare: shareItem, onShareBatch: shareBatch }))) : null,            st.view === 'public' ? h(PanelBoundary, { label: '公开问答' }, h('div', { className: 'k27' }, h(PublicQA, { st, set, onOpen: openThread, onSync }))) : null,
             st.view === 'thread' ? h(PanelBoundary, { label: '问答详情' }, h('div', { className: 'k27' }, h(ThreadView, { st, set, onFollowup }))) : null,
             st.view === 'lesson' ? h(PanelBoundary, { label: '课时作业' }, h('div', { className: 'k27' }, h(LessonPage, { st, set, onGrade: onGrade, onAssignPick: assignPick }))) : null,
             st.view === 'submit' ? h(PanelBoundary, { label: '提交历史' }, h('div', { className: 'k27' }, h(SubmissionHistory, { st, set, onGrade: onGrade, onOpenLesson: openLesson }))) : null,

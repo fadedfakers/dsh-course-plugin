@@ -41,6 +41,10 @@ export * from './setup.js'
 // 缓存路径（**有路径穿越防护**）/ 类型判断 / Content-Type。
 // 真正的 fetch 与写盘在 host.js 的 registerMedia 里。
 export * from './media.js'
+// 「资料」清单：课件原件 / 讲义 PDF / 数据集怎么发给学生（读清单、判类型、定预览方式）。
+// 与 materials.js 分工不同 —— 那边是「老师拖进来的文件该归到哪」，
+// 这边是「已经放好的东西学生怎么拿到」。见 resources.js 顶部的长注释。
+export * from './resources.js'
 // 起子进程并**收回输出**（git / 发布工具）。用它而不是 spawnSync 的 encoding：
 // 沙箱不给管道，带 encoding 的 spawnSync 一律 EPERM，而且**不抛异常** ——
 // 表现为「退出码 null + 没有输出」，看起来像 git 自己没说话。详见 run.js 顶部注释。
