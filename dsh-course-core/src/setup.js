@@ -330,8 +330,12 @@ export function explainCloneOutput(r, name) {
   const tail = lines.slice(-6).join(' / ').slice(0, 600)
   const hint = /not found|does not exist|404/i.test(all)
     ? '—— 多半是仓名拼错、或者这是个私有仓而你没配凭据。'
-    : (/could not resolve host|connection|timed out|reset/i.test(all)
-      ? '—— 连不上 GitHub。看看网络或代理，然后重试（重试是有用的）。'
+    // ⚠️ 措辞不许点名 GitHub：远端可能是局域网共享盘 / 自建 git（见 repo.js 的 sanitizeRemoteUrl）。
+    //    说"连不上 GitHub"会让那类老师去查一个跟他无关的东西。
+    //    `connect`（不带 ion）是给 `Failed to connect to <host> port <n>` 这种被拒的连接留的 ——
+    //    原来那几个词都匹配不到它，于是"地址填错/服务没起"这类失败**一句提示都没有**。
+    : (/could not resolve host|connection|connect|timed out|reset|refused/i.test(all)
+      ? '—— 连不上远端。看看网络或代理，然后重试（重试是有用的）。'
       : '')
   return { ok: false, why: 'git clone 失败（exit ' + code + '）：' + (tail || '（没有输出）') + hint + '　仓名：' + name }
 }

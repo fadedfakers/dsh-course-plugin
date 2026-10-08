@@ -28,7 +28,7 @@ import path from 'node:path'
 import os from 'node:os'
 import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 // 缓存层：派生数据（课程树 / 提交清单）的加速。单一事实来源仍是磁盘原始文件，
 // 条目按来源 mtime+size 失效；缓存坏了只会退化成重算，不会让面板出错。
 import { cached, statOf, sameStat, clearCache, cacheInfo, cacheDir } from './cache.js'
@@ -296,6 +296,32 @@ export function gitArgv(git, args) {
     return { cmd: process.env.ComSpec || 'cmd.exe', args: ['/c', git, ...args] }
   }
   return { cmd: git, args }
+}
+
+/**
+ * 杀**一整棵**子进程树，不只是直接那个子进程。
+ *
+ * ⚠️ 为什么 `child.kill()` 不够 —— 这是被测试抓出来的，不是想出来的：
+ *    当 git 不是 `git.exe` 而是一个 `.cmd` 包装器时（本项目就用这种做法做测试夹具，
+ *    用户那边也可能遇到 scoop/chocolatey 装的 shim），`gitArgv` 会把它包成
+ *    `cmd /c <git.cmd> …`。这时 `child` 是 **cmd.exe**，
+ *    `child.kill()` 杀掉 cmd.exe 之后，它下面那个真正的 git/node **会继续跑**。
+ *    后果很具体：超时提示里说"已经把它停掉了"，而它其实还在后台下载、
+ *    继续往落点目录里写 —— 老师重试时撞上"目录非空"，
+ *    而他会以为是插件没清理干净（提示里恰好又说是他没删）。
+ *
+ * Windows 上唯一可靠的做法是 `taskkill /T`（杀掉整棵树）。
+ * `stdio: 'ignore'` 是**必须**的：沙箱不给管道，捕获输出会 EPERM，
+ * 而这里本来也不需要它的输出。
+ */
+function killTree(child) {
+  if (!child) return
+  try { child.kill() } catch (e) { /* 已经退了 */ }
+  if (process.platform !== 'win32') return
+  if (!child.pid) return
+  try {
+    spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+  } catch (e) { /* 杀不掉也不能因此把任务卡住 —— 上面那次 kill 至少杀了直接子进程 */ }
 }
 
 export const CHAPTERS = ['第一章', '第二章', '第三章']
@@ -1069,7 +1095,7 @@ export function createCore(ctx, opts) {
    * 但那个校验发生在**写配置之前**，而这里是最后一道 —— 认错了的后果是
    * 面板从此指向一个空目录，直到有人手工改回配置文件。
    */
-  function adoptWorkspace(dirAbs, how) {
+  function adoptWorkspace(dirAbs, how, extra) {
     const abs = path.resolve(dirAbs)
     const marker = path.join(abs, WORKSPACE_MARKER[0], WORKSPACE_MARKER[1])
     if (!fs.existsSync(marker)) {
@@ -1080,6 +1106,20 @@ export function createCore(ctx, opts) {
       how: how || '首次启动向导', tried: [abs + ' ✓'], shared: false,
       workspaceFile: WS.workspaceFile || defaultWorkspaceFile(),
     }
+    /**
+     * `extra.courseDir`：共享式布局下**切到某一门课**时用（顶栏的课程切换器）。
+     *
+     * 那种布局里 `课程/<码>/` 自己**没有** `课程中心/` —— 共享内容（索引、课件）
+     * 在上一层。所以「工作区目录」与「课程目录」是两个不同的东西，
+     * 只认前者的写法会把切换到的课又指回根目录（看起来切换成功、其实没换）。
+     *
+     * ⚠️ 判据（`课程中心\课程结构索引.json`）仍然只对**工作区目录**成立，
+     *    上面那行 existsSync 检查的就是它 —— 不要改成检查 courseDir。
+     */
+    const courseDirAbs = (extra && extra.courseDir) ? path.resolve(extra.courseDir) : abs
+    WS.courseDir = courseDirAbs
+    WS.courseCode = (extra && extra.courseCode) || ''
+    WS.shared = courseDirAbs !== abs
     WORKSPACE = abs
     COURSE_DIR = abs
     COURSE = readCourseConfig([COURSE_DIR, WORKSPACE])
@@ -1095,15 +1135,33 @@ export function createCore(ctx, opts) {
      */
     try {
       const idx = JSON.parse(fs.readFileSync(marker, 'utf8'))
+      /**
+       * ⚠️ 切换课程时**不许**用根目录那份索引补课名 —— 顺序在这里很关键。
+       *
+       * 共享式布局里 `课程中心\课程结构索引.json` 在**根目录**，而它是**共享**内容：
+       * 拿它给某一门课起名，等于把 A 课的名字挂到 B 课上（而界面会一本正经地显示）。
+       * 这时课名的唯一来源是 `listCourses()` —— 它读的是**那门课自己的**
+       * `课程配置.json`，也就是用户在切换器里刚刚点的那一项。
+       * 所以这条判断必须排在索引补名**之前**：排在后面的话，
+       * 索引已经把 title 换成根目录那个名字了，这里的条件（"还是默认名"）永远不成立。
+       */
+      const switching = !!(extra && extra.title)
+      if (switching && oneLine(COURSE.title) === COURSE_DEFAULTS.title) {
+        COURSE = Object.assign({}, COURSE, { title: String(extra.title) })
+      }
       // ⚠️ 判据是「title 还是**内置默认值**」，不是「title 非空」——
       //    readCourseConfig 读不到配置时给的就是占位名「深度学习课程」，
       //    那个值**非空**，所以写成 `!COURSE.title` 会让补写永远不发生。
       //    手误成 `!oneLine('')` 更坏：恒为真，每次向导都把真课名冲掉。
       //    这一步是「用户核对这是不是我那门课」的信息来源，说错了就是让他核对假信息。
-      if (idx && idx.course && oneLine(COURSE.title) === COURSE_DEFAULTS.title) {
+      if (!switching && idx && idx.course && oneLine(COURSE.title) === COURSE_DEFAULTS.title) {
         COURSE = Object.assign({}, COURSE, { title: String(idx.course) })
       }
-      // 索引里有课程码时也补上（面板要用它拼仓名 / 默认落点）
+      // 索引里有课程码时也补上（面板要用它拼仓名 / 默认落点）。
+      // 切换时用 extra.courseCode（列表里那一项的码），同样不拿根目录的索引去猜。
+      if (switching && extra.courseCode && !oneLine(COURSE.code)) {
+        COURSE = Object.assign({}, COURSE, { code: String(extra.courseCode) })
+      }
       if (idx && idx.code && !oneLine(COURSE.code)) {
         COURSE = Object.assign({}, COURSE, { code: String(idx.code) })
       }
@@ -1467,12 +1525,37 @@ export function createCore(ctx, opts) {
     const r = await new Promise((resolve) => {
       let child = null
       let settled = false
+      let timedOut = false
       const finish = (v) => { if (!settled) { settled = true; resolve(v) } }
       try {
         const ofd = fs.openSync(outPath, 'w')
         const efd = fs.openSync(errPath, 'w')
         const ga = gitArgv(git, args)
         child = spawn(ga.cmd, ga.args, { stdio: ['ignore', ofd, efd], windowsHide: true })
+        /**
+         * ⚠️ 硬超时。这条异步路（为了进度条而用 spawn 边跑边读）**原来一个超时都没有** ——
+         *    而同步那条路（runCaptured）是有的（600000）。
+         *
+         * 少了它的后果不是"慢"，是**出不来**：网络半死不活时（公司代理吞包、
+         * 酒店/校园网的 captive portal、网线拔了）clone 会一直挂着，老师的进度条
+         * 永远停在「正在 clone」，界面没有任何按钮能让他退出 —— 唯一的出路是重启 DSH。
+         * 而那时他并不知道该不该等。"永远 running"是这套向导里最糟的一种失败。
+         *
+         * 10 分钟是按「几百 MB 的课程仓 + 慢网」留的余量，不是按"看起来够快"。
+         * 超时后**必须 kill 掉子进程**：只是不再等它的话，它会继续占着落点目录，
+         * 老师重试时撞上"目录非空"又是另一个看不懂的错。
+         *
+         * ⚠️ `CIP_CLONE_TIMEOUT_MS` 是**给测试用的**口子（与本项目其它测试口子
+         *    同一套做法：CIP_GIT_BIN / CIP_WORKSPACE_FILE / CIP_COURSE_DIR）。
+         *    没有它，"超时这条路"就只能靠真等 10 分钟来验 —— 等于永远没人验，
+         *    而它是**唯一一条能把老师从"永远转圈"里救出来**的路。
+         */
+        const timeoutMs = Number(process.env.CIP_CLONE_TIMEOUT_MS) > 0
+          ? Number(process.env.CIP_CLONE_TIMEOUT_MS) : 600000
+        const killTimer = setTimeout(() => {
+          timedOut = true
+          killTree(child)
+        }, timeoutMs)
         const timer = setInterval(() => {
           // 轮询 stderr 的最新一行 → 解析成进度。**所有异常都吞掉**：
           // 轮询失败最多是进度不动，绝不能把 clone 弄挂。
@@ -1495,14 +1578,15 @@ export function createCore(ctx, opts) {
             }
           } catch (e) { /* 轮询读不到就跳过这一轮 */ }
         }, 400)
-        child.on('error', (e) => { clearInterval(timer); finish({ status: null, error: e }) })
+        child.on('error', (e) => { clearInterval(timer); clearTimeout(killTimer); finish({ status: null, error: e, timedOut }) })
         child.on('close', (code) => {
           clearInterval(timer)
+          clearTimeout(killTimer)
           try { fs.closeSync(ofd) } catch (e) { /* 已关 */ }
           try { fs.closeSync(efd) } catch (e) { /* 已关 */ }
-          finish({ status: code, error: null })
+          finish({ status: code, error: null, timedOut })
         })
-      } catch (e) { finish({ status: null, error: e }) }
+      } catch (e) { finish({ status: null, error: e, timedOut }) }
     })
     let stdout = ''
     let stderr = ''
@@ -1512,6 +1596,21 @@ export function createCore(ctx, opts) {
     const explained = explainCloneOutput(captured, parsed.name)
     const steps = [{ cmd: 'git ' + args.join(' '), code: runExitCode(captured), out: runOutput(captured).slice(-4000) }]
     try { fs.rmSync(tmp, { recursive: true, force: true }) } catch (e) { /* 清不掉不影响 */ }
+    // 超时先说，别让下面的 explainCloneOutput 去解释一份因为被杀而残缺的输出 ——
+    // 那会给出"连不上"之类的答案，而真实原因是"它挂住太久了"。
+    if (r.timedOut) {
+      job.status = 'failed'; job.endedAt = Date.now(); job.step = 'clone 超时'
+      job.result = {
+        ok: false, step: 'clone', steps, remote: parsed.remote, dir: target,
+        error: 'clone 跑了超过 10 分钟还没结束，已经把它停掉了。多半是网络把它卡住了'
+          + '（公司代理、酒店/校园网那种要先登录的页面、或者网线断了）。'
+          + '换个网络重来一次通常就好；如果重来时提示落点不是空的，把 '
+          + target + ' 里那份没下完的东西删掉再点一次'
+          + '（**插件不会替你删目录** —— 它从第一天起就不动你没让它动的东西）。'
+          + '实在不行可以让老师把课程仓打包发给你，用「更多选项 → 就用这个目录」指过来。',
+      }
+      return
+    }
     if (!explained.ok) {
       job.status = 'failed'; job.endedAt = Date.now(); job.step = 'clone 失败'
       job.result = { ok: false, step: 'clone', error: explained.why, steps, remote: parsed.remote, dir: target }
@@ -1563,6 +1662,167 @@ export function createCore(ctx, opts) {
   function findWriteHint() {    try { return fs.existsSync(WORKSPACE) ? WORKSPACE : os.homedir() } catch (e) { return undefined }
   }
 
+  /**
+   * ── 课程切换 ────────────────────────────────────────────────────────────
+   *
+   * 老师的原话：「课程切换（展示/切换公开仓）没做」。
+   *
+   * 实际情况是：**解析链早就会解析多门课**（`resolveWorkspace` 会遍历
+   * `<根>/课程/<码>/`，共享式布局里共享内容在上一层），
+   * 但界面上**没有任何地方**告诉你现在是哪一门、也没有任何办法切过去 ——
+   * 于是老师只能靠改环境变量或手改那个配置文件。功能在、入口不在。
+   *
+   * 这一组补的就是入口，而且刻意**只做两件事**：
+   *   · `course.list`  **只读**：这台机器上还有哪几门课可以切过去；
+   *   · `course.switch` 切过去（**写的是那门课自己的目录**，见下面的注释）。
+   *
+   * ⚠️ 为什么"切过去"要写**课程目录**而不是根目录：
+   *    共享式布局里根目录下有 `课程/A`、`课程/B` 两门课，把根目录写进配置文件，
+   *    下次启动 `resolveWorkspace` 会**自动挑第一个**（按码排序）——
+   *    于是老师切到 B、重启之后又变回 A。症状是"切换不管用"，
+   *    而中间没有任何一步会报错。写课程目录之后，
+   *    解析链从那个目录向上找到共享内容，认出来的就是这一门。
+   */
+  function courseEntry(dirAbs, how, code) {
+    const abs = path.resolve(dirAbs)
+    let title = ''
+    try { title = oneLine(JSON.parse(fs.readFileSync(path.join(abs, COURSE_CONFIG_REL), 'utf8')).title) } catch (e) { /* 没有配置就用索引 */ }
+    if (!title) {
+      try { title = oneLine(JSON.parse(fs.readFileSync(path.join(abs, WORKSPACE_MARKER[0], WORKSPACE_MARKER[1]), 'utf8')).course) } catch (e) { /* 两处都读不到就留空 */ }
+    }
+    return { dir: abs, code: String(code || ''), title, how }
+  }
+
+  const samePath = (a, b) => {
+    try { return path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase() } catch (e) { return false }
+  }
+
+  function courseState() {    const root = path.resolve(WORKSPACE)
+    const curDir = path.resolve(COURSE_DIR || WORKSPACE)
+    const seen = new Set([curDir.toLowerCase()])
+    const options = []
+    // ① 当前这门（永远排第一，界面于是总能显示"现在在哪"）
+    options.push(Object.assign(courseEntry(curDir, '当前', WS.courseCode), { kind: 'current', isCurrent: true }))
+    /**
+     * ② 同一个根目录下**另外那几门**（共享式布局）。
+     *    ⚠️ 用 `listCourses(root)` 而不是自己 readdir：那个函数同时给出
+     *       "这门课有没有自己的 课程配置.json"，是课名的唯一来源（见 adoptWorkspace 的注释）。
+     */
+    for (const c of listCourses(root)) {
+      if (seen.has(c.dir.toLowerCase())) continue
+      seen.add(c.dir.toLowerCase())
+      options.push(Object.assign(courseEntry(c.dir, '同一目录下的课程', c.code), { kind: 'layout', isCurrent: false }))
+    }
+    /**
+     * ③ `~/DSH-*`（向导已经算过的那一份，见 setupState）。
+     *    老师手上有几个 clone 时，这是最省事的切换方式 —— 不必敲路径。
+     *    只列**看起来像工作区**的那些：列一个点不动的项比不列更糟。
+     */
+    let nearby = []
+    try {
+      nearby = fs.readdirSync(os.homedir(), { withFileTypes: true })
+        .filter((e) => e.isDirectory() && /^DSH-/i.test(e.name))
+        .map((e) => path.join(os.homedir(), e.name))
+        .filter((p) => {
+          const marker = path.join(p, WORKSPACE_MARKER[0], WORKSPACE_MARKER[1])
+          try { return fs.existsSync(marker) } catch (err) { return false }
+        })
+        .slice(0, 8)
+    } catch (e) { nearby = [] }
+    for (const p of nearby) {
+      if (seen.has(p.toLowerCase())) continue
+      seen.add(p.toLowerCase())
+      options.push(Object.assign(courseEntry(p, '这台机器上以前 clone 的', ''), { kind: 'nearby', isCurrent: false }))
+    }
+    return {
+      ok: true,
+      current: Object.assign(courseEntry(curDir, WS.how || '', WS.courseCode), {
+        workspace: root, shared: !!WS.shared, courseTitle: COURSE.title || '',
+      }),
+      // `canSwitch` 是给界面用的：只有一项可选时不该摆一个下拉框（那会让人以为坏了）
+      options,
+      canSwitch: options.length > 1,
+      workspaceFile: defaultWorkspaceFile(),
+    }
+  }
+
+  /**
+   * 切到另一门课 —— **一个入口，两种情形**。
+   *
+   * 为什么合成一个而不是给界面两个动作：
+   *   对老师来说"换一门课"就是一件事。分成「同目录下换课」与「换到另一个 clone」
+   *   两条路，界面就得自己判断该调哪个 —— 判断散在两处必然漂移，
+   *   而漂移的症状是"点了没反应"或者"切过去还是旧数据"。
+   *
+   * 两种情形的差别只在**代价**，不在语义：
+   *   · `dir` 就在当前根目录的 `课程/` 下 → 热切换（`useCourse`，同步换三个值 + 清缓存），
+   *     共享内容本来就在同一个根，不必重新认工作区；
+   *   · 别的目录（另一个 clone、另一个根）→ 向上找共享内容 → 重新认下来。
+   */
+  function courseSwitch(args) {
+    const want = oneLine(args && args.dir)
+    if (!want) return { ok: false, error: '没说要切到哪一门课。' }
+    const abs = path.resolve(want)
+    const root = path.resolve(WORKSPACE)
+    const code = oneLine(args && args.code)
+    const markerOk = (d) => {
+      try { return fs.existsSync(path.join(d, WORKSPACE_MARKER[0], WORKSPACE_MARKER[1])) } catch (e) { return false }
+    }
+
+    // 情形一：同一根目录下的另一门课（`<根>/课程/<码>/`）
+    const inRootCourses = path.join(root, COURSE_HOME_DIR)
+    const isSibling = code && samePath(path.dirname(abs), inRootCourses)
+    if (isSibling) {
+      // ⚠️ 必须**真的**存在才算数：`useCourse` 找不到课程码时会抛，
+      //    那是对的（绝不能悄悄回落到根目录 —— 见 useCourse 的注释）。
+      //    但抛出来的异常在这里**接住并变成 ok:false**：这个函数既被 HTTP 层调，
+      //    也被断言与被 `switchCourse` 直接调；让它在一条路上抛、另一条路上返回
+      //    `{ok:false}`，调用方就得两套写法都写一遍 —— 而漏掉一套的症状是
+      //    "点了切换什么都没发生，控制台里一行红字"。统一成返回对象。
+      let r = null
+      try {
+        r = useCourse(code)
+      } catch (e) {
+        return { ok: false, error: String((e && e.message) || e) }
+      }
+      const wf = writeWorkspaceFile(abs)
+      // ⚠️ 这里不能调 `info()`：它是 core **返回对象上的一个键**，
+      //    不是本作用域里的函数（第一版就是这么写的，一调用就是
+      //    `info is not defined`，而它只在"同根换课"这一条路上才炸）。
+      //    要回给界面的那几个字段，直接从 courseState() 拿。
+      return Object.assign({ ok: true, switchedTo: abs, workspaceFile: wf }, r, courseState())
+    }
+
+    // 情形二：换到另一个目录（另一个 clone / 另一个根）
+    let target = abs
+    let hops = 0
+    while (!markerOk(target) && hops < 3) {
+      const up = path.dirname(target)
+      if (up === target) break
+      target = up
+      hops += 1
+    }
+    if (!markerOk(target)) {
+      return {
+        ok: false,
+        error: '这个目录不是课程工作区（缺 ' + WORKSPACE_MARKER.join('\\') + '）：' + abs
+          + '　切换只认这一个判据 —— 与首次启动向导、与解析链用的是同一条。',
+      }
+    }
+    // 传 title/code 的理由见 adoptWorkspace 里那段：共享布局下根目录那份索引
+    // **不是**这门课的索引，不能拿它起名。
+    const entry = courseEntry(abs, '面板顶栏切换', code)
+    const adopted = adoptWorkspace(target, '面板顶栏切换课程', {
+      courseDir: abs, courseCode: code, title: entry.title,
+    })
+    if (!adopted.ok) return adopted
+    // 写**课程目录**（不是工作区目录）：共享式布局里根目录下有 A、B 两门课，
+    // 写根目录的话下次启动会按码排序自动挑第一个 —— 老师切到 B、重启又变回 A，
+    // 症状是"切换不管用"，而中间没有任何一步会报错。
+    const wf = writeWorkspaceFile(abs)
+    return Object.assign({ ok: true, switchedTo: abs, workspaceFile: wf }, courseState())
+  }
+
   /** 向导的动作集合。各插件在自己的 handlers 里 `...core.coreHandlers` 合并进去。 */
   const coreHandlers = {
     'setup.info': async () => setupState(),
@@ -1585,6 +1845,16 @@ export function createCore(ctx, opts) {
     // 它是**两端都要有**的内核能力（学生要下载、老师要核对清单），
     // 让两个插件各自展开同一份，就不存在"一端加了另一端忘了"。
     'materials.list': async () => materialsState(),
+    // 课程切换（多门课 / 多个 clone 时用）。
+    //
+    // ⚠️ 只挂**一个**动作，而且名字是 `course.switch`（两端通用）。
+    //    那个"还能去哪几门课"的清单**不进 coreHandlers**，而是像 `setupState`
+    //    那样挂在 core 对象上（`courseOptions`）—— 因为教师端已经有一个
+    //    `course.list`，形状不同。两边同名的话，谁赢取决于 `...core.coreHandlers`
+    //    的展开顺序，而对象字面量允许重复键、**不报错**：
+    //    症状是界面上少了几个可切的课，且没有任何地方提示。
+    //    这个项目已经在 `info().course` 那个键上栽过一次同样的跟头。
+    'course.switch': async (args) => courseSwitch(args && typeof args === 'object' ? args : {}),
   }
 
   // ── 资料（课件原件 / 讲义 PDF / 数据集）─────────────────────────────
@@ -2704,6 +2974,15 @@ export function createCore(ctx, opts) {
     //    （有断言守着，见 verify-setup-wizard.mjs）。
     coreHandlers,
     setupState,
+    /**
+     * 「这台机器上还有哪几门课能切过去」—— 只读，不起子进程。
+     *
+     * 挂在 core 对象上而不是 coreHandlers 里，理由见 coreHandlers 里那段：
+     * 教师端已有同名的 `course.list`，两端各注册各的动作名，就不会打架。
+     */
+    courseOptions: () => courseState(),
+    /** 顶栏切换器用它（学生端以后要加也走同一个动作）。 */
+    switchCourse: (args) => courseSwitch(args || {}),
     // 同步的 clone 前置判断（不起进程、不联网）：断言用它测「地址/落点行不行」那几条，
     // 界面用它… 不用 —— 但两处的判据必须是同一份，所以它得能被测到。
     planClone,

@@ -299,7 +299,7 @@ window.__ModuleLoader__.load({
       const priv = (rs && rs.privateRepo) || null
       const sum = (pub && pub.summary) || null
       return h('div', { className: 'kcb' },
-        h('div', { className: 'k64' }, '① 仓库状态'),
+        h('div', { className: 'k64' }, '① 仓库状态（能不能发出去）'),
         sum ? h('div', { className: 'kd1' }, sum.text)
           : h('div', { className: 'k21' }, rs ? '仓库状态读不出来（多半是宿主半区没重启）' : '正在读仓库状态…'),
         pub ? h('div', { className: 'kce' },
@@ -332,7 +332,7 @@ window.__ModuleLoader__.load({
       const init = st.repoInit
       const manual = (st.repoStatus && st.repoStatus.manual) || ''
       return h('div', { className: 'kcb' },
-        h('div', { className: 'k64' }, '② 建仓（先在本机准备好）'),
+        h('div', { className: 'k64' }, '② 建仓（先在这台机器上把仓准备好）'),
         h('div', { className: 'kd1' }, '点下面的按钮，插件会在这台机器上把公开仓工作区变成 git 仓库、'
           + '把 origin 连到 GitHub —— **不动网络、不推送**。GitHub 上的空仓要你自己建'
           + '（建仓要走它的接口，接口要凭据，而插件里不放任何人的密钥），建完回来照抄下面的命令推一次。'),
@@ -420,7 +420,7 @@ window.__ModuleLoader__.load({
       const next = useInit ? init.next : ((rs && rs.next) || [])
       const hasToken = useInit && !!init.hasToken
       return h('div', { className: 'kcb' },
-        h('div', { className: 'k64' }, '③ 发布，然后推送'),
+        h('div', { className: 'k64' }, '③ 发布并推送（学生在 GitHub 上拿到的那一份）'),
         h('div', { className: 'kd1' }, '第一步「发布」插件替你跑：把公共面与教案写进公开仓工作区、'
           + '生成 课程.json 与 公开问答.json。这一步不联网、不花额度。'
           + '第二步「推送」要用你的凭据，插件里不放任何人的密钥，所以命令给你照抄。'),
@@ -462,7 +462,7 @@ window.__ModuleLoader__.load({
         // ⚠️ 「拉失败」与「还没回来」必须分开说（同学生端那一处）。
         //    只显示"正在读…"的话，一次失败看起来像永远在加载。
         return h('div', { className: 'kcb' },
-          h('div', { className: 'k64' }, '③c 资料（学生能下载 / 在线看的东西）'),
+          h('div', { className: 'k64' }, '⑤ 资料（学生能下载 / 在线看的东西）'),
           st.materialsError
             ? h('div', { className: 'k57', style: { color: 'var(--dsw-alias-state-error-primary)' } },
               '读不出来：' + st.materialsError + '　（多半是宿主半区没重启；重启后点「重新读一次」）')
@@ -472,7 +472,7 @@ window.__ModuleLoader__.load({
       const broken = items.filter((x) => !x.ok)
       const online = items.filter((x) => x.kind === 'pdf' && !x.remote)
       return h('div', { className: 'kcb' },
-        h('div', { className: 'k64' }, '③c 资料（学生能下载 / 在线看的东西）'),
+        h('div', { className: 'k64' }, '⑤ 资料（学生能下载 / 在线看的东西）'),
         h('div', { className: 'kd1' }, '这份清单在工作区根目录的 **资料.json**，面板的「资料」页按它渲染。'
           + '课件原件（pptx）浏览器打不开，所以要配一份转好的 PDF —— 跑 '
           + '`node tools/make-materials.mjs --convert` 会自动转并刷新清单。'),
@@ -572,7 +572,7 @@ window.__ModuleLoader__.load({
         (v && v.hasRepo && v.note) ? h('div', { className: 'k57' }, '（' + v.note + '）') : null)
       if (!vi) {
         return h('div', { className: 'kcb' },
-          h('div', { className: 'k64' }, '③b 版本（学生该克隆哪一份）'),
+          h('div', { className: 'k64' }, '④ 版本（学生该克隆哪一份）'),
           h('div', { className: 'k21' }, '正在读版本信息…'))
       }
       const pub = vi.public || null
@@ -583,7 +583,7 @@ window.__ModuleLoader__.load({
         : (vd.level === 'ok' ? 'var(--dsw-alias-state-success-primary)'
           : (vd.level === 'warn' ? 'var(--dsw-alias-state-warn-primary)' : 'var(--dsw-alias-bg-layer-1)'))
       return h('div', { className: 'kcb' },
-        h('div', { className: 'k64' }, '③b 版本（学生该克隆哪一份）'),
+        h('div', { className: 'k64' }, '④ 版本（学生该克隆哪一份）'),
         h('div', { className: 'kd1' }, '把下面这条命令发给学生，他 clone 下来的就是这个版本；'
           + '面板与课程内容是一起发出去的，版本对不上面板会出现「未知动作」这类怪现象。'),
         // 学生拿到的就是这个仓库 —— 所以先摆它，再摆课程工作区
@@ -617,19 +617,81 @@ window.__ModuleLoader__.load({
           : h('div', { className: 'k57' }, '还没有能发给学生的命令 —— 公开仓要么还没在本机准备好，要么还没连到 GitHub（见上面②建仓卡）。'))
     }
 
+    // ── 发布：问题池同步（两台教师机之间）──
+    /**
+     * 老师实测出来的那条（原话）：
+     *   「在我同事电脑上能跑，但问题池被收集到了本地 —— 学生端的提问只能在本地的
+     *     教师端看到，无法在我这边看到，这是不正常的」
+     *
+     * 这一块就是它的答案。要说清三件事，缺一件老师就会继续困惑：
+     *   ① **为什么学生的问题不会自动过来**：公开仓按设计忽略了 `课程问题池/`
+     *      （防的是学生一次 `git add -A` 就把全班提问推上公开仓）；
+     *   ② **管道其实已经接好了**：教师机的工作区本身就是那个私有仓；
+     *   ③ **缺的只是按一下**：推/拉各一条命令，两台机器各做一次。
+     *
+     * ⚠️ 为什么按钮只做「读状态」、推送留给老师照抄命令：
+     *    推送要用凭据，而插件从第一天起的口径是「不放任何人的密钥」；
+     *    拉取会动工作区（可能覆盖本机未提交的东西），在备课数据上自动 merge
+     *    是不可接受的风险。所以这里给**命令**，不替他执行 —— 与建仓、发布同一条纪律。
+     */
+    function SyncCard({ st, onSync, onCopy }) {
+      const s = st.syncStatus
+      const copied = st.syncCopied || ''
+      const row = (label, cmd) => h('div', null,
+        h('div', { className: 'k64' }, label),
+        h('pre', { className: 'k39', style: { maxHeight: '160px', overflow: 'auto' } }, cmd),
+        h('div', { className: 'kca' },
+          h('button', { className: 'k42', onClick: () => onCopy(cmd) }, copied === cmd ? '已复制 ✓' : '复制这几条')))
+      return h('div', { className: 'kcb' },
+        h('div', { className: 'k64' }, '⑥ 问题池同步（两位老师之间）'),
+        h('div', { className: 'kd1' }, '学生的提问写在**他自己那台机器**上，公开仓按设计不收它'
+          + '（否则学生一次 `git add -A` 就把全班提问推上公开仓了）。'
+          + '两位老师之间靠**私有仓**互通，而你这台的工作区就是那个私有仓 —— '
+          + '所以「同事看得到、我看不到」的修法就是**各做一次**：他推、你拉。'),
+        h('div', { className: 'kca' },
+          h('button', { className: 'k42 k11', disabled: st.busy, onClick: () => onSync() },
+            st.busy ? '读取中…' : '看看本机与私有仓差多少')),
+        // ⚠️ 错误要**在卡里**说，不能只丢进页面顶上的 notice：
+        //    老师点的是这一张卡上的按钮，反馈却在别处，他会以为按钮没反应。
+        st.syncError ? h('div', { className: 'k57', style: { color: 'var(--dsw-alias-state-error-primary)' } },
+          '读不出来：' + st.syncError) : null,
+        !s ? null : h('div', null,
+          h('div', { className: 'kc8' },
+            bdg(s.status === 'in-sync' ? '已同步' : (s.status === 'pending' ? '有东西要同步' : '还没接上'),
+              s.status === 'in-sync' ? 'var(--dsw-alias-state-success-primary)' : 'var(--dsw-alias-state-warn-primary)'),
+            h('span', { className: 'k57', style: { fontWeight: 600, color: 'var(--text)' } }, s.text)),
+          s.remote ? h('div', { className: 'k57' }, '私有仓：' + s.remote + (s.branch ? ('　分支 ' + s.branch) : '')) : null,
+          s.changedCourse && s.changedCourse.length
+            ? h('div', { className: 'k57' }, '要同步的文件（前 8 个）：'
+              + s.changedCourse.slice(0, 8).join('、') + (s.changedCourse.length > 8 ? (' …共 ' + s.changedCourse.length + ' 个') : ''))
+            : null,
+          s.note ? h('div', { className: 'k57' }, s.note) : null,
+          s.pushCmd ? row('把本机的提问/作业推上去（同事那边看不到时，先确认你做了这一步）', s.pushCmd) : null,
+          s.pullCmd ? row(s.diverged ? '拉对方的（两边都改过时用这条）' : '拉对方的改动下来', s.pullCmd) : null,
+          h('div', { className: 'k57' }, '⚠️ 推送要用你自己的凭据，所以插件**不替你执行** —— '
+            + '在终端里跑上面那几条即可（凭据只经过你的终端，不进插件、也不进仓库）。'))
+      )
+    }
+
     // ── 发布 ──
     /**
      * 「归档与发布」这一页的顺序是**照老师的问题顺序**排的：
      *   ① 现在能不能发出去 → ② 不能的话差哪一步（建仓 / 连 remote）→ ③ 发布并推送
-     *   → ④ 上传材料归位 → ⑤ 待发布清单（发之前到底会带哪些东西）
+     *   → ④ 学生该克隆哪一份（版本）→ ⑤ 学生能下载/在线看什么（资料）
+     *   → ⑥ 两位老师之间怎么互通（问题池同步）→ ⑦ 上传材料归位 → ⑧ 待发布清单
+     *
+     * ⚠️ 编号原来长成 `③b / ③c / ③d`：那是**我加卡时的写法**（插一个就挂个字母，
+     *    免得动后面几条的编号）。老师看到的却是一串字母编号 —— 他问"③b 是什么"，
+     *    而答案只是"我懒得重排"。既然这一页是给他照着顺序做的，
+     *    编号就必须是 ①②③… 一路到底，中途不许冒出字母。
      *
      * ⚠️ 上传归位原来在最前面（「老师打开这一页多半是想把材料放进来」）。
-     *    现在往前挪了三块，是因为仓库那三件事是**前置条件**：材料放好了、发布也跑了，
+     *    现在挪到后面，是因为仓库那几件事是**前置条件**：材料放好了、发布也跑了，
      *    但只要没推到 GitHub，学生那边什么都没有 —— 而这一页过去不回答这个问题。
      *
      * 每一块各自套一个错误边界：一块崩了不该让整页红屏（学生端踩过这个坑）。
      */
-    function Publish({ st, set, onRefresh, onPublish, onPlan, onRepoStatus, onRepoInit, onLoadVersion, onCompareVersion, onLoadMaterials }) {
+    function Publish({ st, set, onRefresh, onPublish, onPlan, onRepoStatus, onRepoInit, onLoadVersion, onCompareVersion, onLoadMaterials, onSyncStatus, onCopyCmd }) {
       const s = st.staged
       return h('div', { className: 'k46' },
         h('div', { className: 'k64' }, '归档与发布'),
@@ -645,9 +707,14 @@ window.__ModuleLoader__.load({
         // 那个动作是纯读盘的，而版本比对要联网（上一轮为此打红过验收）。
         h(PanelBoundary, { label: '版本' }, h(VersionCard, { st, onLoadVersion, onCompareVersion })),
         h(PanelBoundary, { label: '资料清单' }, h(TeacherMaterials, { st, onReload: onLoadMaterials })),
-        h('div', { className: 'k64' }, '④ 材料归位'),
+        // ⚠️ 同步卡紧接在资料后面、**在④材料归位之前**：老师在这一页的动作顺序是
+        //    「发出去 → 学生问 → 我答 → 同事那台也要看到」。前三步都在这一页完成，
+        //    而第四步过去**这一页根本不提** —— 这就是老师实测出来「同事看得到、
+        //    我看不到」的直接成因（管道接好了，但没有任何地方告诉他按哪里）。
+        h(PanelBoundary, { label: '问题池同步' }, h(SyncCard, { st, onSync: onSyncStatus, onCopy: onCopyCmd })),
+        h('div', { className: 'k64' }, '⑦ 材料归位'),
         h(PanelBoundary, { label: '材料归位' }, h(MaterialsTable, { st, set, onPlan })),
-        h('div', { className: 'k64' }, '⑤ 待发布清单'),
+        h('div', { className: 'k64' }, '⑧ 待发布清单（发之前会带哪些东西）'),
         s ? h('div', null,
           h('div', { className: 'k57' }, '工作区：' + s.workspace),
           h('div', { className: 'k57' }, '公共面：' + s.publicDir + '（' + (s.files || []).length + ' 份）'),
@@ -1899,6 +1966,61 @@ window.__ModuleLoader__.load({
     }
 
     // ── 面板 ──
+    /**
+     * ── 顶栏的课程切换器 ────────────────────────────────────────────────
+     *
+     * 老师的原话：「课程切换（展示/切换公开仓）没做」。
+     *
+     * 查过之后，真实情况是三件事叠在一起，所以看起来像"没做"：
+     *   ① 老的下拉框**只在当前根目录下有多门课时**才出现（`avail.length > 1`）。
+     *      老师手上有好几个 clone（`~/DSH-A`、`~/DSH-B`）时，那些
+     *      **根本不在这个列表里** —— 屏幕上永远只有一个课程名，看不出能切。
+     *   ② 切换**不落盘**：`course.use` 只改内存里的 COURSE_DIR。重启之后
+     *      `resolveWorkspace` 重新按课程码排序挑第一个 —— 切到 B、重启又变回 A，
+     *      症状正是"切换不管用"。
+     *   ③ 它**从不显示公开仓**。两个公开仓摆在面前时，屏幕上没有任何东西
+     *      告诉老师"学生 clone 的是哪一份"，而发错链接的后果是学生拿到另一门课。
+     *
+     * 这个组件把三件事一次说清：现在在哪一门、还能去哪几门、公开仓是哪一个。
+     *
+     * ⚠️ 只有一项可切时**不摆下拉框**，只显示当前这门 —— 一个只有一项的下拉框
+     *    会让人以为"是不是坏了/还有别的没加载出来"，这比不显示更糟。
+     */
+    function CourseSwitch({ st, onSwitch }) {
+      const info = st.courseInfo
+      const cur = (info && info.current) || (st.info && st.info.course) || null
+      const opts = (info && info.options) || []
+      const others = opts.filter((o) => !o.isCurrent)
+      const [open, setOpen] = React.useState(false)
+      const label = cur ? ((cur.title || cur.code || '未命名') + (cur.code ? ('（' + cur.code + '）') : '')) : '读不到课程'
+      const tip = cur
+        ? ('课程目录：' + (cur.dir || '') + '\n工作区：' + (cur.workspace || '')
+          + (cur.shared ? '\n（这门课与别的课共用同一份课件与教案，切换只换提问/作业/名册）' : ''))
+        : ''
+      // 一项都切不了：就是一个纯文字标签，不带任何"这里能点"的暗示
+      if (!others.length) {
+        return h('span', { className: 'k9c', title: tip }, '课程：' + label)
+      }
+      return h('span', { style: { position: 'relative', display: 'inline-block' } },
+        h('button', {
+          className: 'k42', 'data-on': open ? '1' : '0', title: tip + '\n（点开可以切到别的课）',
+          onClick: () => setOpen(!open),
+        }, '课程：' + label + ' ▾'),
+        open ? h('div', {
+          className: 'kcb',
+          style: { position: 'absolute', zIndex: 40, top: '110%', left: 0, minWidth: '320px', maxHeight: '60vh', overflow: 'auto' },
+        },
+          h('div', { className: 'k57' }, '切到另一门课（换的是提问、作业、名册这些私有数据；课件与教案是共享内容）'),
+          others.map((o) => h('div', {
+            key: o.dir, className: 'kd9', style: { cursor: 'pointer' },
+            onClick: () => { setOpen(false); onSwitch(o.dir, o.code) },
+          },
+            h('div', { className: 'k64', style: { margin: 0 } }, (o.title || o.code || o.dir) + (o.code ? ('　' + o.code) : '')),
+            h('div', { className: 'k57' }, o.how + '：' + o.dir))),
+          h('div', { className: 'k57' }, '⚠️ 选中的这一门会**记到配置文件里** —— 下次启动面板直接打开它，'
+            + '不会又回到按课程码排序的第一门。')) : null)
+    }
+
     function Panel() {
       const init = {
         view: 'questions', mode: 'region', chapter: '第一章', slideIndex: 0, zoom: 1,
@@ -2278,11 +2400,45 @@ window.__ModuleLoader__.load({
       }, [loadStudents, loadThreads, loadSubs])
 
       // ── 换课（热切换，不重启）──
+      /**
+       * 老师说「课程切换（展示/切换公开仓）没做」。
+       *
+       * 查过之后：**切换本身早就有了**（`course.use` 热切换，换的是提问/作业/
+       * 名册那一半私有数据），但那个下拉框只在「当前根目录下有多门课」时才出现，
+       * 而且它做的事**不落盘** —— 重启之后 `resolveWorkspace` 会重新按课程码排序
+       * 自动挑第一个，于是老师切到 B、重启又变回 A，症状是"切换不管用"。
+       * 而且它从不显示**公开仓**：老师有多个 clone 时，屏幕上没有任何东西
+       * 告诉他"我现在看的是哪一份、要发给学生哪一条链接"。
+       *
+       * 现在走 `course.switch`（内核的动作，一个入口两种情形：
+       * 同根下换课 / 换到另一个目录），并且**把选择写进配置文件**。
+       */
+      const onSwitchCourse = React.useCallback(async (dir, code) => {
+        if (!dir) return
+        set({ busy: true, error: '', notice: '' })
+        try {
+          const r = await api('course.switch', { dir, code: code || '' })
+          if (r && r.ok === false) throw new Error(r.error || '切换被拒了')
+          // 换课等于换了整个数据面：所有列表都要重拉，缓存也要丢。
+          // `st.info` 一并清掉 —— 它是上一次 info 的快照，留着会让顶栏
+          // 短暂显示"上一门课"的数据（课程名换了、条数还是旧的）。
+          set({
+            busy: false, info: null,
+            notice: '已切到「' + ((r.current && r.current.title) || code || dir) + '」。'
+              + '提问、作业、名册都跟着换了；课件与教案是共享内容，不受影响。'
+              + (r.current && r.current.shared ? '（这门课与别的课共用同一份课件）' : ''),
+            studentDetail: null, rosterEdit: null, thread: null, selPath: '', anchorEdit: null,
+            syncStatus: null, versionInfo: null, materials: null,
+          })
+          await loadAll()
+        } catch (err) { set({ busy: false, error: '切课失败：' + ((err && err.message) || String(err)) }) }
+      }, [])
+      // 上一次那个名字（`course.use`）留着：学生端与别的调用点还在用它，
+      // 而它现在只是 `course.switch` 的一个特例（同根内换课）。
       const onUseCourse = React.useCallback(async (code) => {
         set({ busy: true, error: '', notice: '' })
         try {
           const r = await api('course.use', { code })
-          // 换课等于换了整个数据面：所有列表都要重拉，缓存也要丢
           set({ busy: false, notice: r.note, studentDetail: null, rosterEdit: null, thread: null, selPath: '', anchorEdit: null })
           await loadAll()
         } catch (err) { set({ busy: false, error: '切课失败：' + ((err && err.message) || String(err)) }) }
@@ -2460,6 +2616,76 @@ window.__ModuleLoader__.load({
           })
         }
       }, [])
+      /**
+       * 问题池同步（两台教师机之间）—— **只读状态**，绝不动仓库。
+       *
+       * ⚠️ 这个动作在宿主侧会 spawn `git status` + `git log`（不联网），比
+       *    `repo.status`（纯读 .git/config）重，所以**不放进**切页时的自动加载：
+       *    老师打开「归档发布」是常事，不该每次都为它起两个子进程。
+       *    要点「看看差多少」才读 —— 与版本比对同样是**由人决定什么时候花这笔钱**。
+       */
+      const loadSyncStatus = React.useCallback(async () => {
+        set({ busy: true })
+        try {
+          const r = await api('repo.syncStatus', {})
+          set({ syncStatus: r, syncError: '', busy: false })
+        } catch (err) {
+          // 同 loadRepo：新动作，旧宿主上没有它 —— 走 notice 不走 error。
+          set({
+            syncStatus: null, busy: false,
+            syncError: (err && err.message) || String(err),
+            notice: '「归档发布」里的问题池同步暂时读不到（多半是宿主半区没重启），其余功能不受影响。',
+          })
+        }
+      }, [])
+      const onCopyCmd = React.useCallback((text) => {
+        // 与 VersionCard 里那个 copy 同一套三分支：有 clipboard 就用、
+        // 老浏览器退 execCommand、都没有时**不假装成功**。
+        try {
+          if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text)
+            set({ syncCopied: text })
+            return
+          }
+        } catch (err) { /* 落到下面 */ }
+        let ok = false
+        try {
+          if (typeof document !== 'undefined' && document.createElement) {
+            const ta = document.createElement('textarea')
+            ta.value = text
+            document.body.appendChild(ta)
+            ta.select()
+            ok = !!(document.execCommand && document.execCommand('copy'))
+            document.body.removeChild(ta)
+          }
+        } catch (err) { ok = false }
+        set({ syncCopied: ok ? text : ('手抄：' + text) })
+      }, [])
+      // ── 顶栏那两块读盘信息（课程清单 + 公开仓）──
+      /**
+       * ⚠️ 这两个动作都是**纯读盘**的（`course.list` 只读 .git/config，
+       *    `course.options` 只列目录），所以放在每次加载都走的 `loadAll` 里。
+       *    一旦哪天有人在宿主侧给它们加上 spawn git / 联网，
+       *    症状就是"一打开面板就卡住"或者"连不上网时整条顶栏空了" ——
+       *    `acceptance-publish.mjs` 第 9 节那条"repo.status 不许混进版本信息"
+       *    守的就是同一类事。
+       */
+      const loadCourseInfo = React.useCallback(async () => {
+        try {
+          const r = await api('course.list', {})
+          set({ courseInfo: r })
+        } catch (err) {
+          // 老宿主上没有这个动作 —— 走 notice 不走 error（红条会挂在每一页上）
+          set({ courseInfo: null })
+        }
+      }, [])
+      const loadCourseOptions = React.useCallback(async () => {
+        try {
+          const r = await api('course.options', {})
+          // 与 course.list 合并：current 用 course.list 那份（它多带 publicRepo）
+          set((prev) => ({ courseInfo: Object.assign({}, prev.courseInfo || {}, r) }))
+        } catch (err) { /* 清单读不到就只剩"当前这一门"，不弹红条 */ }
+      }, [])
       const onBatch = React.useCallback(async (paths, decision) => {
         set({ busy: true, error: '' })
         try {
@@ -2489,6 +2715,10 @@ window.__ModuleLoader__.load({
       React.useEffect(() => { if (st.view === 'publish' && !stRef.current.versionInfo) loadVersion(false) }, [st.view, loadVersion])
       // 资料清单：切到「归档发布」时读一次（读的是一个 json，很便宜）
       React.useEffect(() => { if (st.view === 'publish' && !stRef.current.materials) loadMaterials() }, [st.view, loadMaterials])
+      // 课程清单与可切项：**首次加载就读**（不像仓库状态那样等切页）——
+      // 顶栏每一页都要显示"现在是哪一门、公开仓是哪一个"，而那两个动作都只读盘。
+      React.useEffect(() => { loadCourseInfo() }, [loadCourseInfo])
+      React.useEffect(() => { loadCourseOptions() }, [loadCourseOptions])
 
       const views = [
         { id: 'questions', label: '提问与审计' },
@@ -2505,8 +2735,11 @@ window.__ModuleLoader__.load({
         { id: 'publish', label: '归档发布' },
       ]
       const c = st.info && st.info.counts ? st.info.counts : {}
+      // ⚠️ `avail`（当前根目录下可切的课）已经从顶栏挪进 `CourseSwitch` 里了：
+      //    这里原来只列"同一个根目录下的课"，而老师手上有好几个 clone 时
+      //    那几个**根本不在这个列表里** —— 屏幕上看起来只有一门课可切，
+      //    于是「课程切换没做」这个判断就是这么来的。
       const course = (st.info && st.info.course) || null
-      const avail = (course && course.available) || []
       return h('div', { className: 'k22' },
         h('div', { className: 'k23' },
           h('div', null,
@@ -2514,22 +2747,32 @@ window.__ModuleLoader__.load({
               h('div', { className: 'k10' }, '至圣先师鼹鼠精 · 教师端'),
               h('span', { className: 'k9b', 'data-role': 'teacher', title: '教师端：审计、归档、发布不花额度；只有「教案补全」里的生成会调用模型' }, '教师'),
               st.info && st.info.teacher ? h('span', { className: 'k9c' }, st.info.teacher) : null,
-              // ── 当前课程 ──────────────────────────────────────
+              // ── 当前课程 + 切换 ──────────────────────────────
               // 老师同时教几门课时，「我在看哪一门」必须一眼可见 ——
               // 否则很容易把 A 班的问题池当成 B 班的，而这种错自己发现不了。
-              // 多于一门课时它还是个下拉框：切换是**热切换**，不用重启
-              // （换的是私有数据那一半，课件与教案是共享内容，不动）。
-              avail.length > 1
-                ? h('select', {
-                  className: 'kcc', style: { maxWidth: '200px' },
-                  value: (course && course.code) || '',
-                  title: '切换课程：换的是提问、作业、名册这些私有数据；课件与教案是共享内容，不受影响。',
-                  onChange: (e) => onUseCourse(e.target.value),
-                }, [h('option', { key: '__root', value: '' }, '（根目录即课程）')]
-                  .concat(avail.map((a) => h('option', { key: a.code, value: a.code },
-                    a.code + (a.title ? ('　' + a.title) : '')))))
-                : h('span', { className: 'k9c', title: course ? ('课程目录：' + course.dir) : '' },
-                  course ? ('课程：' + (course.title || course.code || '未命名') + (course.code ? ('（' + course.code + '）') : '')) : '')),
+              // 切换是**热切换**，不用重启（换的是提问/作业/名册那一半私有数据；
+              // 课件与教案是共享内容，不动）。
+              h(CourseSwitch, { st, onSwitch: onSwitchCourse }),
+              // 公开仓：屏幕上必须有一处写清「学生 clone 的是哪一份」。
+              // 老师教两门课时会有两个公开仓，而发错链接的后果是学生拿到另一门课。
+              // ⚠️ 它来自 `course.list`（纯读 .git/config），**不联网** ——
+              //    顶栏每次渲染都要走这里，挂上网络就会出现"一打开面板就卡住"。
+              //
+              // 点它直接跳到「归档发布」：这是老师看到这个地址之后**唯一想做的事**
+              // （核对 / 重建 / 抄给学生）。做成纯文字的话，他还得自己在左侧栏里
+              // 找到那一页 —— 而"看到了信息却到不了能改它的地方"是这一页最常见的抱怨。
+              st.courseInfo && st.courseInfo.current && st.courseInfo.current.publicRepo
+                && st.courseInfo.current.publicRepo.remote
+                ? h('button', {
+                  className: 'k42', title: '这是学生 clone 的那个仓。点一下去「归档发布」核对或重建。',
+                  onClick: () => set({ view: 'publish' }),
+                }, '公开仓：' + st.courseInfo.current.publicRepo.remote.replace(/^https:\/\/(www\.)?github\.com\//, ''))
+                : h('button', {
+                  className: 'k42', 'data-on': '1',
+                  style: { color: 'var(--dsw-alias-state-warn-primary)' },
+                  title: '还没有公开仓 —— 学生拿不到任何东西。点一下去「归档发布」的②建仓。',
+                  onClick: () => set({ view: 'publish' }),
+                }, '公开仓：还没建')),
             h('div', { className: 'k41' }, st.info
               ? ('提问 ' + (c.items || 0) + ' 条 · 学生 ' + (c.students || 0) + ' 人'
                 + (c.named !== undefined ? ('（有姓名 ' + c.named + '）') : '')
@@ -2595,6 +2838,8 @@ window.__ModuleLoader__.load({
                 onLoadVersion: loadVersion, onCompareVersion,
                 // 资料清单：发布页那一块"学生能下载/在线看什么"
                 onLoadMaterials: loadMaterials,
+                // 问题池同步：读状态（spawn git，只在点按钮时走）、复制命令
+                onSyncStatus: loadSyncStatus, onCopyCmd,
               })) : null,
             // 每个视图各自一个错误边界：一个视图崩了不该把整页变成红屏
             // （学生端踩过：一个视图调错函数，整块面板全红）。

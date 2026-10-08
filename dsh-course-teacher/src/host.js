@@ -84,6 +84,9 @@ export async function apply(ctx) {
     // 它唯一的去处是「显示给老师自己敲」的那条命令。readRepoState() 的返回已经脱敏，
     // 界面拿到的 remote 永远不含凭据（这条踩过两次，见 repo.js 里的注释）。
     repoSlug, readRepoState, repoSummary, manualSteps, remoteUrl,
+    // 两位老师之间的「问题池同步」要用：让 git 在**图上**算领先/落后，
+    // 并把 porcelain 输出变成"哪几个文件"。判据都在 repo.js 里，只有一份。
+    parseAheadBehind, parseChangedPaths, COURSE_DATA_RE,
     // 版本控制信息（老师要据此给学生一条克隆命令）。放在这一组里，
     // 因为它同样只读仓库事实、不碰 token —— versionInfo 复用了 readRepoState
     // 已经脱敏过的 remoteSafe。
@@ -623,6 +626,165 @@ export async function apply(ctx) {
     },
 
     /**
+     * ── 「问题池同步」（两位老师 / 老师 + 助教）──────────────────────────
+     *
+     * 老师实测出来的问题（原话）：
+     *   「在我同事电脑上能跑，但是问题池是被收集到了本地，也就是说学生端的提问，
+     *     只能在本地的教师端看到无法在我这边看到，这是不正常的」
+     *
+     * 查清的事实（不是猜的）：
+     *   · 学生的提问写在**他自己机器**的 `课程问题池/学生/<学号>/`；
+     *   · 公开仓的 `.gitignore` 忽略 `课程问题池/`（这条是**对的** —— 防隐私泄漏：
+     *     学生一次 `git add -A` 不该把全班提问推上公开仓）；
+     *   · 所以那个目录**永远不会**随公开仓到老师这儿；
+     *   · 而教师机的工作区本来就是私有仓（`origin = …-privated`），
+     *     两台机器各有一份，**只是没人推、也没人拉**。
+     *
+     * 结论：这不是"同步坏了"，是**这套插件从来没给老师一个同步的入口**。
+     * 这一组动作补的就是它 —— 而且它**只报告 + 给命令**，绝不替老师推送：
+     * 推送要用凭据，而插件从第一天起的口径是"不放任何人的密钥"
+     * （与建仓 / 发布同一条纪律）。
+     *
+     * ⚠️ 为什么 `pull` 也不替老师做：pull 会**动工作区**（可能覆盖本机未提交的东西）。
+     *    在老师的备课数据上自动跑 merge 是不可接受的风险 ——
+     *    给命令、让他自己看一眼再跑，比省那一次点击重要得多。
+     */
+    async 'repo.syncStatus'() {
+      const nodeFs = await import('node:fs')
+      const nodePathMod = await import('node:path')
+      const ws = core.WORKSPACE
+      const git = nodeFs.existsSync(GIT_HARD_PATH) ? GIT_HARD_PATH : 'git'
+      const st = readRepoState(ws)
+      /**
+       * 显示哪个远端地址：**优先 GitHub 归一化形式，但没有就照实显示别的形状**。
+       *
+       * ⚠️ 这里原来只认 `remoteSafe`（GitHub 形状），于是远端是
+       *    局域网共享盘 / 自建 git / GitLab 的老师会看到
+       *    「本机是 git 仓库，但**没有连远端**」—— 而他的 `git push` 一直好好的。
+       *    界面在说假话，而且说的正好是"这件事做不到"，于是他不会再去试。
+       *    对"两台教师机互通"来说远端在哪家托管根本不重要 —— 推送是 git 的事。
+       *    （这条是写测试时用真裸仓造出来的，见 verify-question-pool-sync.mjs 第 3 节。）
+       */
+      const remoteShown = st.remoteSafe || st.remoteAny || ''
+      const out = {
+        ok: true, workspace: ws, hasRepo: st.hasRepo, remote: remoteShown, branch: st.branch || '',
+        owner: st.owner || '', name: st.name || '',
+        ahead: null, behind: null, graphOk: false,
+        changed: [], changedCourse: [], changedOther: 0,
+        diverged: false,
+        status: '', text: '', pushCmd: '', pullCmd: '', note: '',
+      }
+      if (!st.hasRepo) {
+        out.status = 'no-repo'
+        out.text = '课程工作区还不是一个 git 仓库 —— 学生的问题存在本机，但没有任何地方可以同步出去。'
+        out.note = '先在「② 建仓」里把工作区连到私有仓（你自己那个 -privated 仓）。'
+        return out
+      }
+      if (!remoteShown) {
+        out.status = 'no-remote'
+        out.text = '本机是 git 仓库，但**没有连远端** —— 所以提问只在你这台机器上，同事那台看不到。'
+        out.note = '在「② 建仓」里填 owner / 私有仓名，点「在本机把仓库准备好」即可连上。'
+        return out
+      }
+      // 改动：只看**课程数据**那一类（理由见 repo.js 的 COURSE_DATA_RE 注释）
+      //
+      // ⚠️ `--no-optional-locks` 不是装饰：`git status` 默认会**刷写 .git/index**
+      //    （更新 stat 缓存），也就是要拿 index 锁。老师很可能同时在终端里敲 git
+      //    （推完东西、切分支），撞上就是他那条命令报
+      //    `fatal: Unable to create '.git/index.lock': File exists` ——
+      //    而他会以为是插件把仓库弄坏了。加上这个开关，我们这次读**绝不碰锁**。
+      //    一个只报状态的按钮不该有能力干扰老师自己的 git。
+      const stt = runCaptured(git, ['--no-optional-locks', '-C', ws, 'status', '--porcelain=v1'], { timeout: 60000, hintDir: ws })
+      if (runExitCode(stt) === 0) {
+        const all = parseChangedPaths(stt.stdout)
+        out.changed = all
+        out.changedCourse = all.filter((p) => COURSE_DATA_RE.test(p))
+        out.changedOther = all.length - out.changedCourse.length
+      }
+      // 领先/落后：**让 git 在图上算**，不猜
+      //
+      // ⚠️ 必须是 `rev-list`，**不能**是 `log`：`git log --count` 里那个开关
+      //    被 git 静默忽略，它会把对称差里的提交连同**日期**一起打出来，
+      //    而日期里的两个数（`Oct 8 19:10`）正好长得像"领先 8、落后 19"。
+      //    教师机上那句「已经提交但还没推上去的有 22 个提交」就是这么来的 ——
+      //    两个数字都是假的，而界面上看起来毫无破绽。
+      //    详见 repo.js 的 parseAheadBehind 注释。
+      const ref = st.branch ? ('origin/' + st.branch) : 'origin/main'
+      const lg = runCaptured(git, ['--no-optional-locks', '-C', ws, 'rev-list', '--left-right', '--count',
+        (st.branch || 'HEAD') + '...' + ref], { timeout: 60000, hintDir: ws })
+      if (runExitCode(lg) === 0) {
+        const ab = parseAheadBehind(lg.stdout)
+        if (ab) { out.ahead = ab.ahead; out.behind = ab.behind; out.graphOk = true }
+      }
+      if (!out.graphOk) {
+        // ⚠️ 措辞不许点名 GitHub：远端可能是局域网共享盘 / 自建 git（见上面的 remoteShown）。
+        //    说"连不上 GitHub"会让那类老师去查一个跟他无关的东西。
+        out.note = '读不到「与远端差几个提交」（多半是这台机器还没 fetch 过，或者现在连不上远端）。'
+          + '下面那两条命令仍然可用。'
+      }
+      // 一句人话
+      const parts = []
+      if (out.changedCourse.length) parts.push('本机有 ' + out.changedCourse.length + ' 个课程数据文件改了、还没提交')
+      if (out.ahead) parts.push('已经提交但还没推上去的有 ' + out.ahead + ' 个提交')
+      if (out.behind) parts.push('远端有 ' + out.behind + ' 个提交你还没拉下来')
+      if (!parts.length) parts.push('本机的课程数据与远端一致（没有要推的，也没有要拉的）')
+      out.text = parts.join('；') + '。'
+      out.status = (!out.changedCourse.length && !out.ahead && !out.behind) ? 'in-sync' : 'pending'
+      /**
+       * 推送命令：用绝对路径 cd，老师从别处的终端也能照抄。
+       *
+       * ⚠️ `git add` 后面只列**真的存在**的路径。
+       *    原来是一行写死 7 个路径，其中一个不存在时 git 会报
+       *    `fatal: pathspec '学生名册.json' did not match any files` 并**整个 add 失败** ——
+       *    老师看到的是"推送第一步就红了"，而真实原因只是"这个文件他还没有"。
+       *    多台机器上文件本来就不一样（有人有名册、有人没有），所以必须逐条判存在。
+       */
+      const coursePaths = ['课程问题池', '作业提交', '教案草稿', '课程配置.json', '学生名册.json', '资料.json', '资料']
+        // ⚠️ 用 node:fs 的 existsSync，**不是** ctx.get('fs') 那个注入层 ——
+        //    后者只有 resolve/readText/writeText 这些（没有 existsSync）。
+        //    第一版用了它，于是每个 `existsSync` 都抛、被 catch 吞掉，
+        //    结果列表为空、命令退化成 `git add -A`（会把 112 个源码改动一起提交！）。
+        .filter((p) => { try { return nodeFs.existsSync(nodePathMod.join(ws, p)) } catch (e) { return false } })
+      /**
+       * ⚠️ 一个课程数据文件都不存在时**不给 push 命令**，更不许退回 `git add -A`。
+       *
+       * 原来这里写的是 `coursePaths.length ? … : 'git add -A'` —— 而上面那行过滤器
+       * 一旦因为任何原因返回空（注入层没有 existsSync、路径大小写不对、工作区换过位置），
+       * 老师就会拿到一条**会把 100 多个源码改动一起提交**的命令，而且它看起来完全正常。
+       * 这是"静默地把用户的数据搞乱"，比报错严重得多。
+       *
+       * 正确的话是：这台机器上根本没有课程数据要同步。那就如实说，不给命令 ——
+       * 「没有可同步的东西」本来就不需要一条命令。
+       */
+      out.pushCmd = coursePaths.length
+        ? ['cd "' + ws + '"',
+          'git add ' + coursePaths.join(' '),
+          'git commit -m "同步：本机的提问/作业/教案草稿"',
+          'git push'].join('\n')
+        : ''
+      if (!coursePaths.length) {
+        // ⚠️ 追加而不是覆盖：上面那段可能已经写进「读不到与远端差几个提交」，
+        //    两条都是老师需要知道的事，覆盖掉一条就是丢信息。
+        out.note = (out.note ? (out.note + '　') : '')
+          + '这台机器上还没找到任何课程数据文件（提问池 / 作业 / 教案草稿 / 课程配置），'
+          + '所以没有要同步的东西 —— 也就不给推送命令。'
+      }
+      // 分叉时 `pull --ff-only` 会直接失败，所以那种情况给另一条路
+      out.diverged = !!(out.ahead && out.behind)
+      out.pullCmd = out.diverged
+        ? ['cd "' + ws + '"', '# 两边都改过（本地 ' + out.ahead + ' 个、远端 ' + out.behind + ' 个提交）',
+          '# 先推自己的，再拉对方的；被拒时用下面这条把两边接起来：',
+          'git pull --rebase', 'git push'].join('\n')
+        : ['cd "' + ws + '"', 'git pull --ff-only'].join('\n')
+      if (out.changedOther) {
+        out.note = (out.note ? (out.note + '　') : '')
+          + '（另外还有 ' + out.changedOther + ' 个**与课程无关**的改动没提交 —— 那些是源码/构建产物，'
+          + '不在同步范围内，上面那条 add 也不会带上它们。）'
+      }
+      return out
+    },
+
+    /**
      * 建仓 —— **只在本机把仓库准备好，不联网、不推送**。
      *
      * ── 为什么只做到「本机准备好」────────────────────────────────────
@@ -1141,13 +1303,47 @@ export async function apply(ctx) {
       })
     },
 
+    /**
+     * 顶栏那个课程切换器要的全部东西。
+     *
+     * ⚠️ 它必须是**纯读盘**的（不 spawn git、不联网）：顶栏是每次打开面板都要渲染的
+     *    地方，让它依赖网络就会出现"一打开面板就卡住"或者"连不上时整条顶栏空了"。
+     *    `readRepoState` 只读 `.git/config` 与 `HEAD`，正合适。
+     *
+     * 为什么要有 `publicRemote`：老师教两门课时，两门课各有一个公开仓。
+     * 屏幕上只有课程名的话，他没有任何办法确认"我现在看到的是哪一份、
+     * 要发给学生的是哪一条链接" —— 而发错链接的后果是学生 clone 到另一门课。
+     */
     async 'course.list'() {
       const info = core.info()
+      const course = info.course || {}
+      const pubAbs = core.sharedAbs(PUBLIC_REPO_REL)
+      const pub = readRepoState(pubAbs)
       return {
-        current: info.course,
-        available: info.course.available || [],
+        current: Object.assign({}, course, {
+          // 「公开仓」这一栏：连上 GitHub 就给归一化地址，别的形状就给脱敏后的原样
+          // （见 repo.js 的 sanitizeRemoteUrl —— 远端不一定在 GitHub 上）。
+          publicRepo: { dir: pubAbs, remote: pub.remoteSafe || pub.remoteAny || '', hasRepo: !!pub.hasRepo },
+          // 分发时要发给学生的那条链接：能拼出来才给，拼不出来就留空
+          // （界面据此决定要不要显示"还没建公开仓"）。
+          studentLink: pub.remoteSafe
+            ? (pub.remoteSafe.replace(/\.git$/, '') + (pub.branch ? ('/tree/' + pub.branch) : ''))
+            : '',
+        }),
+        available: course.available || [],
         workspace: core.WORKSPACE,
       }
+    },
+
+    /**
+     * 课程清单：这台机器上**还有哪几门课能切过去**（不只是当前根目录下的）。
+     *
+     * 与 `course.list` 的分工：那个是"现在在哪"，这个是"还能去哪"。
+     * 合起来是老师问的两件事，但它们的代价不同 —— 这个要多读几个目录、
+     * 多扫一次 `~/DSH-*`，所以不放进每次渲染都走的 `course.list`。
+     */
+    async 'course.options'() {
+      return core.courseOptions()
     },
 
     /**

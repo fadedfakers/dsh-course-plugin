@@ -59,12 +59,48 @@ export function parseRemote(url) {
 }
 
 /**
+ * 把一个 remote URL 变成**可以显示**的形式：凭据一律砍掉，其余原样保留。
+ *
+ * 为什么需要它（这条是被测试逼出来的，不是先想出来的）：
+ *   原来 `readRepoState` 只认 GitHub 形状的 URL，别的形状一律算成"没有远端"。
+ *   于是老师把私有仓放在**局域网共享盘 / 自建 git / GitLab** 上时，
+ *   同步卡会说「仓库在本机，但还没有连到远端 —— 提问只在你这台机器上」——
+ *   而他的远端明明配着、`git push` 也一直能用。**界面在说假话。**
+ *   对「两台教师机互通」这件事来说，远端在哪一家托管**根本不重要**：
+ *   我们要的只是"能不能推上去"，而那是 git 的事。
+ *
+ * ⚠️ 同时它必须比原来更严：原来只在 GitHub 形状上做脱敏，
+ *    别的形状直接落成空串 —— 空串当然不漏，但也把"有远端"这个事实一起丢了。
+ *    现在保留原样，所以凭据必须在这里砍干净：
+ *      `https://user:token@host/x.git` → `https://host/x.git`
+ *      `https://token@host/x.git`     → `https://host/x.git`
+ *    本地路径 / `file://` / scp 形式（`git@host:path`）里没有密码段
+ *    （scp 里的用户名不是秘密，密钥不在 URL 里），原样返回即可读。
+ */
+export function sanitizeRemoteUrl(raw) {
+  const s = String(raw || '').trim()
+  if (!s) return ''
+  // 本地路径：Windows 盘符、UNC、POSIX 绝对/相对路径。里面不可能有凭据。
+  if (/^[A-Za-z]:[\\/]/.test(s) || /^\\\\/.test(s) || s[0] === '/' || s[0] === '.') return s
+  if (/^file:\/\//i.test(s)) return s
+  // 带 scheme 的：`scheme://[凭据@]余下` —— 整段凭据砍掉，其余保留
+  const m = /^([A-Za-z][\w+.-]*:\/\/)(?:[^/@]*@)?(.*)$/.exec(s)
+  if (m) return m[1] + m[2]
+  // scp 形式 `git@host:path`：用户名不是秘密，原样
+  return s
+}
+
+/**
  * 读一个目录的仓库状态。**不调用 git**。
  * 读不到就返回 hasRepo:false —— 「不是仓库」是正常状态（老师还没建），不是错误。
  */
 export function readRepoState(dirAbs) {
   const out = {
     dir: dirAbs, hasRepo: false, branch: '', remotes: {}, remote: '', owner: '', name: '',
+    // remoteAny：**任意形状**的远端（脱敏后的可读形式）；remote 只认 GitHub。
+    // 两个都给，是因为用途不同：发布页要的是 GitHub（它用 API 建仓），
+    // 而「两台教师机同步」只要有个远端就行（推送是 git 的事，不是 GitHub 的事）。
+    remoteAny: '', remoteCount: 0,
     ahead: 0, dirty: 0, note: '',
   }
   if (!dirAbs || !fs.existsSync(dirAbs)) { out.note = '目录不存在'; return out }
@@ -96,11 +132,17 @@ export function readRepoState(dirAbs) {
         const p0 = parseRemote(raw)
         out.remotes[cur] = {
           url: p0.owner ? ('https://github.com/' + p0.owner + '/' + p0.name + '.git') : '',
+          // ⚠️ 非 GitHub 形状也要**留一份脱敏后的可读形式**。原来这里给空串，
+          //    于是「远端是局域网共享盘 / 自建 git」被算成"没连远端"（见 sanitizeRemoteUrl 注释）。
+          any: sanitizeRemoteUrl(raw),
           hadToken: /x-access-token:|:[^/@]+@github\.com/.test(raw),
         }
       }
     }
     const origin = out.remotes.origin || out.remotes[Object.keys(out.remotes)[0]]
+    out.remoteCount = Object.keys(out.remotes).length
+    // 任意形状的远端：优先 origin，其次任何一个
+    out.remoteAny = (origin && (origin.any || origin.url)) || ''
     if (origin && origin.url) {
       const p = parseRemote(origin.url)
       out.owner = p.owner; out.name = p.name
@@ -122,9 +164,81 @@ export function readRepoState(dirAbs) {
 export function repoSummary(state) {
   const s = state || {}
   if (!s.hasRepo) return { level: 'none', text: '这门课还没有仓库 —— 学生在等你建一个', canPublish: false }
-  if (!s.remote) return { level: 'no-remote', text: '仓库在本机，但还没有连到 GitHub —— 连上之前学生拿不到任何东西', canPublish: true }
-  return { level: 'ok', text: '已连到 ' + (s.owner ? (s.owner + '/' + s.name) : '远程仓库') + '，分支 ' + (s.branch || '?'), canPublish: true }
+  // ⚠️ 判据用 remote || remoteAny：远端只要**存在**就不能说"没有远端"。
+  //    原来只看 remote（GitHub 形状），于是自建 git / 局域网共享盘 / GitLab
+  //    上的仓被说成「还没有连到 GitHub —— 连上之前学生拿不到任何东西」，
+  //    而老师的 push 一直好好的。**宁可少说一句，也不能说假话。**
+  const anyRemote = s.remote || s.remoteAny || ''
+  if (!anyRemote) {
+    return { level: 'no-remote', text: '仓库在本机，但还没有连远端 —— 连上之前学生拿不到任何东西', canPublish: true }
+  }
+  const where = s.owner ? (s.owner + '/' + s.name) : anyRemote
+  return { level: 'ok', text: '已连到 ' + where + '，分支 ' + (s.branch || '?'), canPublish: true }
 }
+
+/**
+ * `git rev-list --left-right --count <本地>...<远端>` 的输出 → 领先/落后几个提交。
+ *
+ * ── 为什么必须让 git 去数，不能自己读文件 ────────────────────────────────
+ * 「本地比远端多几个提交」是**图上的可达性**问题：要沿 commit 的 parent 边
+ * 双向走一遍才算得准。自己数 refs 只能得到一个唬人的数字，而它恰好会
+ * 说错在最需要它对的场合（分叉、本地 rebase 过、远端被别人推过）。
+ *
+ * git 的输出是 `左<TAB>右`：左边 = 本地独有（ahead）、右边 = 远端独有（behind）。
+ *
+ * ⚠️⚠️ 两条纪律，都是被真事故逼出来的：
+ *
+ *   ① **必须是 `rev-list`，不能是 `log`。** `git log --count` 里那个 `--count`
+ *      **被 git 静默忽略** —— 它照常把对称差里的提交打出来。而这一行输出随后
+ *      被下面这个正则去抓数字，抓到的是提交里的 **日期**：
+ *        `Date:   Thu Oct 8 19:10:52 2026 +0800`  →  抓出 `8` 和 `19`
+ *      于是界面上那句人话变成「已经提交但还没推上去的有 8 个提交；远端有 19 个
+ *      提交你还没拉下来」—— **两个数字都是编出来的，而且看起来完全合理。**
+ *      教师机上当时显示 `22/19`，我还拿它当"真实状态"写进了验收断言。
+ *      这个坑极难发现：命令 exit 0、输出非空、数字像模像样。
+ *      真正对的 `rev-list` 在两边一致时给 `0\t0`、`log` 在那时给**空**。
+ *
+ *   ② **解析必须严格锚定到"整段只有两个数字"**，绝不"在输出里找两个数"。
+ *      宽松匹配正是 ① 能骗过所有人的原因 —— 它让**任何**含两个数字的胡言乱语
+ *      都变成一句可信的话。宁可返回 null（界面说"读不到"），也不许猜。
+ */
+export function parseAheadBehind(stdout) {
+  const m = /^\s*(\d+)\s+(\d+)\s*$/.exec(String(stdout || ''))
+  if (!m) return null
+  return { ahead: Number(m[1]), behind: Number(m[2]) }
+}
+
+/**
+ * `git status --porcelain=v1` 的原始输出 → 改动过的路径列表。
+ *
+ * 为什么这块要单独看：两位老师协作最常出的岔子是
+ * 「我这边看着有 5 条新提问，推上去对面却看不到」—— 因为那 5 条
+ * **根本没进提交**（工作区改了、没 commit）。而 porcelain 的原始输出
+ * 对不懂 git 的老师是一串天书，所以要变成"哪几个文件"。
+ */
+export function parseChangedPaths(porcelain) {
+  const out = []
+  for (const line of String(porcelain || '').split(/\r?\n/)) {
+    if (!line.trim()) continue
+    // porcelain=v1：`XY <path>`；重命名是 `XY <old> -> <new>`
+    let p = line.slice(3).trim()
+    const arrow = p.indexOf(' -> ')
+    if (arrow >= 0) p = p.slice(arrow + 4).trim()
+    if (p.length > 1 && p[0] === '"' && p[p.length - 1] === '"') p = p.slice(1, -1)
+    out.push(p)
+  }
+  return out
+}
+
+/**
+ * 哪些路径算「课程数据」（两位老师之间要同步的东西）。
+ *
+ * ⚠️ 必须有个白名单，不能把 `git status` 里所有东西都算进来：
+ *    老师的仓库里同时躺着**一大堆源码改动**（这个项目自己就是插件开发树，
+ *    实测有几百个改动文件）。全算进来的话这一块会永远显示"有 200 个文件没提交"，
+ *    老师很快就会学会无视它 —— 而那时真的漏了 5 条提问也看不出来了。
+ */
+export const COURSE_DATA_RE = /^(课程问题池|作业提交|教案草稿|课程配置\.json|学生名册\.json|资料\.json|资料\/|课程中心\/预览数据|课程中心\/课程结构索引\.json)/
 
 /**
  * 没有 Token 时的**两条命令**。
