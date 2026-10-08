@@ -2429,8 +2429,14 @@ window.__ModuleLoader__.load({
               + (r.current && r.current.shared ? '（这门课与别的课共用同一份课件）' : ''),
             studentDetail: null, rosterEdit: null, thread: null, selPath: '', anchorEdit: null,
             syncStatus: null, versionInfo: null, materials: null,
+            // ⚠️ `courseInfo` 也必须清掉 —— 它是顶栏那行"现在是哪一门 / 公开仓是哪一个"
+            //    的快照。留着的话，切完之后课程名会**短暂显示上一门课**，
+            //    而顶栏恰恰是老师用来确认"我切对了吗"的地方。
+            //    （这条是 ⑨b 的断言抓出来的：学生端清了、教师端漏了。）
+            courseInfo: null,
           })
           await loadAll()
+          await loadCourseInfo()
         } catch (err) { set({ busy: false, error: '切课失败：' + ((err && err.message) || String(err)) }) }
       }, [])
       // 上一次那个名字（`course.use`）留着：学生端与别的调用点还在用它，

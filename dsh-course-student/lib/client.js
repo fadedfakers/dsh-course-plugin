@@ -1717,6 +1717,59 @@ window.__ModuleLoader__.load({
     }
 
     // ── 面板 ──
+    /**
+     * ── 顶栏的课程切换器 ────────────────────────────────────────────────
+     *
+     * ⚠️ 这个函数在**两端各有一份、必须逐字一致**（`verify-setup-wizard.mjs` ⑨b 有断言守着）。
+     *    为什么不放进共享内核：它与 `SetupWizard` 同一种情况 —— 一开始只有教师端要，
+     *    后来学生端也要了。等哪天要改第三处，再一起搬进 `course-panel-plugin` 的抽取源。
+     *    在那之前，**两份 + 一条防漂移断言**比"一份被复制粘贴改歪了的"安全。
+     *
+     * 学生的场景与老师不同但同样具体：
+     *   · 一个学生同时上两门课（`~/DSH-A`、`~/DSH-B` 两个 clone）时，
+     *     面板里**没有任何地方**能看出现在是哪一门、也没有办法切过去 ——
+     *     他只能去改环境变量。功能在、入口不在。
+     *   · 切错了课的后果是"提交交到另一门课去了"，而界面看起来一切正常。
+     *   · 切换**必须落盘**：只改内存的话，重启又回到按课程码排序的第一门。
+     *
+     * ⚠️ 只有一项可切时**不摆下拉框**，只显示当前这门 —— 一个只有一项的下拉框
+     *    会让人以为"是不是坏了/还有别的没加载出来"，这比不显示更糟。
+     */
+    function CourseSwitch({ st, onSwitch }) {
+      const info = st.courseInfo
+      const cur = (info && info.current) || (st.info && st.info.course) || null
+      const opts = (info && info.options) || []
+      const others = opts.filter((o) => !o.isCurrent)
+      const [open, setOpen] = React.useState(false)
+      const label = cur ? ((cur.title || cur.code || '未命名') + (cur.code ? ('（' + cur.code + '）') : '')) : '读不到课程'
+      const tip = cur
+        ? ('课程目录：' + (cur.dir || '') + '\n工作区：' + (cur.workspace || '')
+          + (cur.shared ? '\n（这门课与别的课共用同一份课件与教案，切换只换提问/作业/名册）' : ''))
+        : ''
+      // 一项都切不了：就是一个纯文字标签，不带任何"这里能点"的暗示
+      if (!others.length) {
+        return h('span', { className: 'k9c', title: tip }, '课程：' + label)
+      }
+      return h('span', { style: { position: 'relative', display: 'inline-block' } },
+        h('button', {
+          className: 'k42', 'data-on': open ? '1' : '0', title: tip + '\n（点开可以切到别的课）',
+          onClick: () => setOpen(!open),
+        }, '课程：' + label + ' ▾'),
+        open ? h('div', {
+          className: 'kcb',
+          style: { position: 'absolute', zIndex: 40, top: '110%', left: 0, minWidth: '320px', maxHeight: '60vh', overflow: 'auto' },
+        },
+          h('div', { className: 'k57' }, '切到另一门课（换的是提问、作业、名册这些私有数据；课件与教案是共享内容）'),
+          others.map((o) => h('div', {
+            key: o.dir, className: 'kd9', style: { cursor: 'pointer' },
+            onClick: () => { setOpen(false); onSwitch(o.dir, o.code) },
+          },
+            h('div', { className: 'k64', style: { margin: 0 } }, (o.title || o.code || o.dir) + (o.code ? ('　' + o.code) : '')),
+            h('div', { className: 'k57' }, o.how + '：' + o.dir))),
+          h('div', { className: 'k57' }, '⚠️ 选中的这一门会**记到配置文件里** —— 下次启动面板直接打开它，'
+            + '不会又回到按课程码排序的第一门。')) : null)
+    }
+
     function Panel() {
       const init = {
         view: 'outline', mode: 'region', chapter: '第一章', slideIndex: 0, zoom: 1,
@@ -2142,11 +2195,59 @@ window.__ModuleLoader__.load({
         } catch (err) { set({ busy: false, error: '截取失败：' + oneLineMsg(err) }) }
       }, [])
 
+      // ── 课程切换（顶栏那个切换器）────────────────────────────────
+      /**
+       * 与教师端同一个口径：`course.list` 是**纯读盘**的（只读 .git/config），
+       * `course.options` 只列目录。两者都不联网、不起子进程 ——
+       * 所以可以在面板打开时就调，不必等用户点。
+       */
+      const loadCourseInfo = React.useCallback(async () => {
+        try { set({ courseInfo: await api('course.list', {}) }) } catch (err) { set({ courseInfo: null }) }
+      }, [])
+      const loadCourseOptions = React.useCallback(async () => {
+        try {
+          const r = await api('course.options', {})
+          set((prev) => ({ courseInfo: Object.assign({}, prev.courseInfo || {}, r) }))
+        } catch (err) { /* 列不出来就只剩"当前这一门"，不弹红条 */ }
+      }, [])
+      /**
+       * 切到另一门课。
+       *
+       * ⚠️ 走的是内核的 `course.switch`（**一个入口两种情形**：同根热切换 /
+       *    换到另一个目录），而且它**会写配置文件** —— 学生重启之后还在这一门，
+       *    不会又回到按课程码排序的第一门。
+       * ⚠️ 换课等于换了整个数据面：提问、提交、课件全都得重拉，缓存也要丢。
+       *    少清一个键的症状是"课程名换了、列表还是上一门课的"。
+       */
+      const onSwitchCourse = React.useCallback(async (dir, code) => {
+        if (!dir) return
+        set({ busy: true, error: '', notice: '' })
+        try {
+          const r = await api('course.switch', { dir, code: code || '' })
+          if (r && r.ok === false) throw new Error(r.error || '切换被拒了')
+          set({
+            busy: false, info: null, courseInfo: null,
+            notice: '已切到「' + ((r.current && r.current.title) || code || dir) + '」。'
+              + '你的提问与提交都跟着换了；课件与教案是共享内容，不受影响。',
+            mine: [], publicItems: [], slides: [], allSubs: [], tree: null, hw: null, hwDraft: null,
+          })
+          await load()
+          await loadAllSubmissions()
+          await loadCourseInfo()
+          await loadCourseOptions()
+        } catch (err) { set({ busy: false, error: '切课失败：' + oneLineMsg(err) }) }
+      }, [load, loadAllSubmissions, loadCourseInfo, loadCourseOptions])
+
       React.useEffect(() => { load() }, [load])
       // 「全部提交」在面板打开时就取一次：它不依赖课时，是「提交历史」页的数据源。
       // 用户的要求是「不点选课时的情况下应默认按时间顺序排列作业提交的记录」，
       // 所以这条请求必须与课时选择完全解耦。
       React.useEffect(() => { loadAllSubmissions() }, [loadAllSubmissions])
+      // 课程清单与可切项：面板一打开就读（两个动作都只读盘，不联网、不起子进程）。
+      // 学生同时上两门课时，"现在是哪一门"必须一眼可见 —— 切错了的后果是
+      // 把作业交到另一门课去，而界面看起来一切正常。
+      React.useEffect(() => { loadCourseInfo() }, [loadCourseInfo])
+      React.useEffect(() => { loadCourseOptions() }, [loadCourseOptions])
       React.useEffect(() => { loadKatex(CFG.katex, { onDone: (ok, err) => set(ok ? { katexReady: true } : { katexError: err || '未知' }) }) }, [])
       // 侧栏收起状态：记住上次的选择。localStorage 在某些嵌入环境下会抛异常
       // （隐私模式 / 三方 cookie 限制），所以包在 try 里 —— 记不住偏好是可以接受的，
@@ -2200,7 +2301,11 @@ window.__ModuleLoader__.load({
                 className: 'k9c', style: { cursor: 'pointer' },
                 title: '老师看到的提问者就是这个名字。点一下改学号 / 姓名 / 班级。',
                 onClick: () => set({ meOpen: !st.meOpen }),
-              }, (st.me.label || st.me.sid) + ' ✎') : null),
+              }, (st.me.label || st.me.sid) + ' ✎') : null,
+              // 课程切换器：与教师端**同一份代码**（verify-setup-wizard ⑨b 有防漂移断言）。
+              // 学生同时上两门课时，这里是他唯一能看出"现在是哪一门"的地方；
+              // 切错了的后果是把作业交到另一门课去，而界面看起来一切正常。
+              h(CourseSwitch, { st, onSwitch: onSwitchCourse })),
             h('div', { className: 'k41' }, st.info
               ? ('我的 ' + ((st.mine || []).length) + ' 条 · 公开 ' + ((st.publicItems || []).length) + ' 条 · 课件 ' + (st.slides ? st.slides.slideCount : 0) + ' 页' + (st.katexReady ? ' · 公式已就绪' : ''))
               : '加载中…')),

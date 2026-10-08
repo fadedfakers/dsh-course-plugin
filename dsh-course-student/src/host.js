@@ -313,6 +313,35 @@ export async function apply(ctx) {
     // ⚠️ 漏了这一行的症状：面板提示「去配工作区」，而向导调的动作返回「未知动作」——
     //    看起来像宿主没重启，其实是这套动作压根没注册。有断言守着。
     ...core.coreHandlers,
+
+    /**
+     * ── 课程切换（学生端）─────────────────────────────────────────────
+     *
+     * 学生同时上两门课时，面板里必须能看出"现在是哪一门"、也必须能切过去。
+     * 在他这台机器上，两门课通常是**两个 clone**（`~/DSH-A`、`~/DSH-B`），
+     * 或者在共享式布局下是同一个根里的 `课程/A`、`课程/B`。
+     *
+     * 真正干活的 `course.switch` 在 `core.coreHandlers` 里（两端通用）；
+     * 这里只补两个**只读**动作：
+     *   · `course.list`    —— 现在在哪一门（界面顶部那行）
+     *   · `course.options` —— 还能去哪几门（下拉框里的项）
+     *
+     * ⚠️ 名称沿用教师端的叫法，但**形状自己定**：学生端不需要 publicRepo
+     *    那一栏（那是老师发布时才关心的东西），硬塞过来只会让界面多一个
+     *    学生看不懂的字段。两端各自注册各自的动作名，内核不掺和 —— 见
+     *    core host 里 coreHandlers 那段关于"同名动作谁赢"的注释。
+     */
+    async 'course.list'() {
+      const info = core.info()
+      return {
+        current: info.course,
+        available: (info.course && info.course.available) || [],
+        workspace: core.WORKSPACE,
+      }
+    },
+    async 'course.options'() {
+      return core.courseOptions()
+    },
     async info() {
       const items = await core.listItems()
       const mine = items.filter((i) => i.student === STUDENT || i.scope === 'legacy')
