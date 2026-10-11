@@ -107,6 +107,55 @@ export async function apply(ctx) {
   const TEACHER = safeId(process.env.CIP_TEACHER || process.env.USERNAME || 'teacher') || 'teacher'
 
   /**
+   * 把老师收上来的「学生 GitHub 账号」折成**用户名**（login）。
+   *
+   * 老师是从各种地方抄来的：班级群里的截图、学生自己发的链接、Excel 里一列。
+   * 同一个东西会以好几种形状出现，而 GitHub 的邀请接口
+   * （`PUT /repos/{owner}/{repo}/collaborators/{username}`）**只认用户名**：
+   *
+   *   `fadedfakers`                         ✅
+   *   `@fadedfakers`                        ✅（从主页复制的就是这种）
+   *   `https://github.com/fadedfakers`      ✅（折掉前缀）
+   *   `github.com/fadedfakers/`             ✅（折掉前缀与尾斜杠）
+   *   `fadedfakers?tab=repositories`        ✅（折掉查询串）
+   *   `xxx@mails.tsinghua.edu.cn`           ❌ **邮箱不是用户名**
+   *
+   * ⚠️ 邮箱那一条为什么值得单独拦下来（而不是让 GitHub 去回 404）：
+   *    那个接口收邮箱会回 `404 Not Found`，而这条消息看起来像"用户名拼错了" ——
+   *    老师会去改一个本来没错的名字，**查错方向**。
+   *    所以格式不对就**一个请求都不发**，直接说清"要的是用户名，不是邮箱，
+   *    让他打开自己的 GitHub 主页，地址栏里 github.com/ 后面那一段就是"。
+   *
+   * ⚠️ 只用参数与 `node:*`：模块级辅助函数不能碰 `apply()` 作用域里的东西
+   *    （这一条在学生端已经踩过三次）。
+   */
+  function normalizeLogin(raw) {
+    let s = String(raw == null ? '' : raw).trim()
+    if (!s) return { login: '', error: '' }
+    s = s.replace(/^@+/, '')
+    // URL 前缀：带不带协议、带不带 www 都可能
+    s = s.replace(/^https?:\/\//i, '').replace(/^www\./i, '').replace(/^github\.com\//i, '')
+    // 查询串/锚点先切掉，再取第一段路径（`/repos` 之类的尾巴一并丢掉）
+    s = s.split(/[?#]/)[0].split('/')[0].replace(/\/+$/, '').trim()
+    if (!s) return { login: '', error: '这一栏里找不到用户名。' }
+    if (s.indexOf('@') >= 0) {
+      return {
+        login: '',
+        error: '这一栏是邮箱（' + s + '）。GitHub 的邀请要的是**用户名**，不是邮箱 ——'
+          + '让他打开自己的 GitHub 主页，地址栏里 github.com/ 后面那一段就是（例如 fadedfakers）。',
+      }
+    }
+    if (!/^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/.test(s)) {
+      return {
+        login: '',
+        error: '这一栏不是合法的 GitHub 用户名（' + s + '）。用户名只能是英文字母、数字、单个横线，'
+          + '且不能以横线开头或结尾。',
+      }
+    }
+    return { login: s, error: '' }
+  }
+
+  /**
    * clone / pull 失败时说人话（**学生那一边的地址**，不是老师自己的仓）。
    *
    * ⚠️ 只用参数与 `node:*`：模块级辅助函数**不能**碰 `apply()` 里解构出来的东西
@@ -905,10 +954,10 @@ export async function apply(ctx) {
         try { for (const it of await core.listItems()) if (it && it.student) students.add(it.student) } catch (e) { /* 读不到提问就只按名册 */ }
         list = [...students].sort().map((sid) => ({ sid, login: '' }))
       }
-      list = list.map((x) => ({
-        sid: safeId(oneLine(x && x.sid)) || '',
-        login: oneLine(x && x.login).replace(/^@/, ''),
-      })).filter((x) => x.sid)
+      list = list.map((x) => {
+        const n = normalizeLogin(x && x.login)
+        return { sid: safeId(oneLine(x && x.sid)) || '', login: n.login, loginError: n.error }
+      }).filter((x) => x.sid)
       if (!list.length) {
         return { ok: false, error: '名单是空的 —— 先在「学生」页把名册弄好，或者手工把学号填进来。' }
       }
@@ -919,7 +968,7 @@ export async function apply(ctx) {
         //    而学号里常常有别的字符（中文、括号）。不过这一道，
         //    建仓请求会被 GitHub 回 422，老师看到的是"名字不合法"却不知道是哪个学生的。
         const repo = repoSlug(prefix + '-q-' + x.sid, prefix + '-q-student')
-        return { sid: x.sid, login: x.login, repo, url: 'https://github.com/' + owner + '/' + repo + '.git' }
+        return { sid: x.sid, login: x.login, loginError: x.loginError, repo, url: 'https://github.com/' + owner + '/' + repo + '.git' }
       })
 
       /** 发给**某一个学生**的那一条（一人一条，不写在一个大群里）。 */
@@ -988,6 +1037,11 @@ export async function apply(ctx) {
           else row.inviteError = iv.status === 404
             ? ('GitHub 上找不到用户 `' + p.login + '`（用户名拼错了？）')
             : ('邀请失败 HTTP ' + iv.status + '：' + oneLine((iv.json && iv.json.message) || '（没有说明）'))
+        } else if ((row.created || row.exists) && wantInvite && p.loginError) {
+          // ⚠️ 账号**格式就不对**（填了邮箱 / 一串别的东西）：一个请求都不发。
+          //    发出去的话 GitHub 会回 404 "Not Found"，而那条消息看起来像
+          //    "用户名拼错了" —— 老师会去改一个本来没错的名字，查错方向。
+          row.inviteError = p.loginError
         }
         results.push(row)
       }
