@@ -1740,34 +1740,71 @@ window.__ModuleLoader__.load({
       const cur = (info && info.current) || (st.info && st.info.course) || null
       const opts = (info && info.options) || []
       const others = opts.filter((o) => !o.isCurrent)
+      const rejected = (info && info.nearbyRejected) || []
       const [open, setOpen] = React.useState(false)
+      const [manual, setManual] = React.useState('')
       const label = cur ? ((cur.title || cur.code || '未命名') + (cur.code ? ('（' + cur.code + '）') : '')) : '读不到课程'
       const tip = cur
         ? ('课程目录：' + (cur.dir || '') + '\n工作区：' + (cur.workspace || '')
           + (cur.shared ? '\n（这门课与别的课共用同一份课件与教案，切换只换提问/作业/名册）' : ''))
         : ''
-      // 一项都切不了：就是一个纯文字标签，不带任何"这里能点"的暗示
-      if (!others.length) {
-        return h('span', { className: 'k9c', title: tip }, '课程：' + label)
-      }
+      /**
+       * ⚠️ 入口**永远在**，哪怕只有一门课可切。
+       *
+       * 这里原来写的是「一项都切不了就退化成一个纯文字标签」。老师的实测反馈是
+       * **「刷新后还是没看到能切换课程的入口」** —— 而那台机器上恰好只有一个工作区
+       * （他手上就那一门课），于是 others 为空、控件变成一行灰字，
+       * 看起来就是"这个功能没做"。
+       *
+       * 「不摆一个只有一项的下拉框」那条道理本身没错（只有一项的下拉框会让人以为坏了），
+       * 但它不该用来**藏掉入口**：正确做法是——**按钮一直在**，
+       * 点开之后如实说"这台机器上就这一门"，并且给一条**手动指路**的路子
+       * （填一个目录 → 切过去，写进配置文件）。老师手上那门课若是自己 clone 的、
+       * 既不在 `课程/` 下也不叫 `DSH-*`，自动发现**永远找不到它**，手动这条路是必须的。
+       */
       return h('span', { style: { position: 'relative', display: 'inline-block' } },
         h('button', {
-          className: 'k42', 'data-on': open ? '1' : '0', title: tip + '\n（点开可以切到别的课）',
+          className: 'k42', 'data-on': open ? '1' : '0',
+          title: tip + '\n（点开可以切到别的课，也可以填一个目录指过来）',
           onClick: () => setOpen(!open),
         }, '课程：' + label + ' ▾'),
         open ? h('div', {
           className: 'kcb',
-          style: { position: 'absolute', zIndex: 40, top: '110%', left: 0, minWidth: '320px', maxHeight: '60vh', overflow: 'auto' },
+          style: { position: 'absolute', zIndex: 40, top: '110%', left: 0, minWidth: '360px', maxWidth: '520px', maxHeight: '64vh', overflow: 'auto' },
         },
           h('div', { className: 'k57' }, '切到另一门课（换的是提问、作业、名册这些私有数据；课件与教案是共享内容）'),
-          others.map((o) => h('div', {
-            key: o.dir, className: 'kd9', style: { cursor: 'pointer' },
-            onClick: () => { setOpen(false); onSwitch(o.dir, o.code) },
-          },
-            h('div', { className: 'k64', style: { margin: 0 } }, (o.title || o.code || o.dir) + (o.code ? ('　' + o.code) : '')),
-            h('div', { className: 'k57' }, o.how + '：' + o.dir))),
+          others.length
+            ? others.map((o) => h('div', {
+              key: o.dir, className: 'kd9', style: { cursor: 'pointer' },
+              onClick: () => { setOpen(false); onSwitch(o.dir, o.code) },
+            },
+              h('div', { className: 'k64', style: { margin: 0 } }, (o.title || o.code || o.dir) + (o.code ? ('　' + o.code) : '')),
+              h('div', { className: 'k57' }, o.how + '：' + o.dir)))
+            : h('div', { className: 'k21' }, '这台机器上目前只找到这一门课。'
+              + '想切到别的课，把它所在的目录填在下面（或者先把它 clone 下来 / 用首次启动向导的「更多选项 → 就用这个目录」指过来）。'),
+          // 手动指路：自动发现在下面两种情况下必然找不到 ——
+          //   ① 那门课不在 `<当前根>/课程/` 下；
+          //   ② 目录名不叫 `DSH-*`（比如自己 `git clone` 到别处）。
+          // 没有这条路的话，上面那句"只找到这一门"就成了一句死话。
+          h('div', { className: 'kca' },
+            h('input', {
+              className: 'k61', style: { flex: '1 1 auto' }, value: manual,
+              placeholder: '另一门课的目录，例如 D:\\课程\\DS2026',
+              onChange: (e) => setManual(e.target.value),
+              onKeyDown: (e) => { if (e.key === 'Enter' && manual.trim()) { setOpen(false); onSwitch(manual.trim(), '') } },
+            }),
+            h('button', {
+              className: 'k42 k11', disabled: !manual.trim(),
+              onClick: () => { setOpen(false); onSwitch(manual.trim(), '') },
+            }, '切到这个目录')),
           h('div', { className: 'k57' }, '⚠️ 选中的这一门会**记到配置文件里** —— 下次启动面板直接打开它，'
-            + '不会又回到按课程码排序的第一门。')) : null)
+            + '不会又回到按课程码排序的第一门。'),
+          // 看见了但用不了的目录也要说出来：老师明明在文件管理器里看得到它，
+          // 而这里一个都没有 —— 不说原因的话，他只会得出"这个切换器是坏的"。
+          rejected.length ? h('div', { className: 'k57' }, '（另外看到 ' + rejected.length + ' 个 DSH-* 目录，'
+            + '但它们不是课程工作区，所以没列出来：'
+            + rejected.slice(0, 3).map((x) => x.dir + ' —— ' + x.why).join('；')
+            + (rejected.length > 3 ? ' …' : '') + '）') : null) : null)
     }
 
     function Panel() {

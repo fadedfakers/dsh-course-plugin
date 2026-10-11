@@ -1697,7 +1697,8 @@ export function createCore(ctx, opts) {
     try { return path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase() } catch (e) { return false }
   }
 
-  function courseState() {    const root = path.resolve(WORKSPACE)
+  function courseState() {
+    const root = path.resolve(WORKSPACE)
     const curDir = path.resolve(COURSE_DIR || WORKSPACE)
     const seen = new Set([curDir.toLowerCase()])
     const options = []
@@ -1716,19 +1717,26 @@ export function createCore(ctx, opts) {
     /**
      * ③ `~/DSH-*`（向导已经算过的那一份，见 setupState）。
      *    老师手上有几个 clone 时，这是最省事的切换方式 —— 不必敲路径。
-     *    只列**看起来像工作区**的那些：列一个点不动的项比不列更糟。
+     *
+     * ⚠️ 只把**看起来像工作区**的那些放进可点列表（列一个点不动的项比不列更糟），
+     *    但那些**不像工作区**的目录也要带出来（`nearbyRejected`）：
+     *    老师在文件管理器里明明看得见 `~/DSH-xxx`，而切换器里一个都没有 ——
+     *    不说原因的话，他只会得出"这个切换器是坏的"。
      */
-    let nearby = []
+    const nearby = []
+    const nearbyRejected = []
     try {
-      nearby = fs.readdirSync(os.homedir(), { withFileTypes: true })
-        .filter((e) => e.isDirectory() && /^DSH-/i.test(e.name))
-        .map((e) => path.join(os.homedir(), e.name))
-        .filter((p) => {
-          const marker = path.join(p, WORKSPACE_MARKER[0], WORKSPACE_MARKER[1])
-          try { return fs.existsSync(marker) } catch (err) { return false }
-        })
-        .slice(0, 8)
-    } catch (e) { nearby = [] }
+      for (const e of fs.readdirSync(os.homedir(), { withFileTypes: true })) {
+        if (!e.isDirectory() || !/^DSH-/i.test(e.name)) continue
+        const p = path.join(os.homedir(), e.name)
+        const marker = path.join(p, WORKSPACE_MARKER[0], WORKSPACE_MARKER[1])
+        let ok = false
+        try { ok = fs.existsSync(marker) } catch (err) { ok = false }
+        if (ok) nearby.push(p)
+        else nearbyRejected.push({ dir: p, why: '里面没有 ' + WORKSPACE_MARKER.join('\\') + '，所以它不是一个课程工作区' })
+        if (nearby.length >= 8 && nearbyRejected.length >= 8) break
+      }
+    } catch (e) { /* 读不到家目录就当没有 */ }
     for (const p of nearby) {
       if (seen.has(p.toLowerCase())) continue
       seen.add(p.toLowerCase())
@@ -1739,9 +1747,16 @@ export function createCore(ctx, opts) {
       current: Object.assign(courseEntry(curDir, WS.how || '', WS.courseCode), {
         workspace: root, shared: !!WS.shared, courseTitle: COURSE.title || '',
       }),
-      // `canSwitch` 是给界面用的：只有一项可选时不该摆一个下拉框（那会让人以为坏了）
       options,
+      // ⚠️ `canSwitch` **不再用来决定"要不要显示入口"**，只用来决定"要不要摆下拉框"。
+      //    这个区分是被真实反馈逼出来的：用户说"刷新后还是没看到能切换课程的入口" ——
+      //    而那台机器上只有一个工作区（他自己那门课），于是 others 为空、
+      //    界面退化成一个**纯文字标签**，看起来就是"没做"。
+      //    入口必须**永远在**：哪怕只有一门课，也要能点开、能填一个目录指过来。
       canSwitch: options.length > 1,
+      // 看见了但用不了的（不是工作区）：界面要能说出原因，而不是装作没看见
+      nearbyRejected,
+      home: os.homedir(),
       workspaceFile: defaultWorkspaceFile(),
     }
   }
