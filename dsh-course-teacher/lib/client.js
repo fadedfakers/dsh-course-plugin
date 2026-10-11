@@ -675,6 +675,108 @@ window.__ModuleLoader__.load({
 
     // ── 发布 ──
     /**
+     * ── ⑨ 学生的提问仓（方案 A：跨机器提问闭环的教师侧）─────────────────
+     *
+     * 老师原话里的难点是**跨机器的协调**，而这段协调里最脏的是：
+     * 30 个学生、每人一个只有他和你可见的仓 —— 手点 30 次建仓 + 30 次邀请 +
+     * 30 条不同的说明，这件事没人会做第二遍。这张卡就是把它变成两次点击：
+     * ① 「批量建仓」→ ② 「拉学生的提问」。
+     *
+     * ⚠️ 为什么必须**每人一个仓**（Git 的权限模型，不是实现选择）：
+     *    任何一个学生能 push 的仓，他同时也能 clone 下来读 ——
+     *    "大家推同一个仓"意味着学生 A 能读到学生 B 的全部提问，
+     *    比公开更糟（因为大家以为它是私密的）。
+     *
+     * ⚠️ token 只在这一个请求的内存里用一次：**不落盘、不进日志、不回传**。
+     *    建完只把「仓名 + 学生账号」写进 `课程发布/学生提问仓.json`。
+     */
+    function StudentRepos({ st, set, onBulk, onPull }) {
+      const r = st.bulkRepos
+      const pulled = st.inboxResult
+      const f = st.bulkForm || {}
+      const rows = (r && r.students) || []
+      const [copied, setCopied] = React.useState('')
+      const copy = (txt) => {
+        try {
+          if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(txt); setCopied(txt); return
+          }
+        } catch (e) { /* 落到下面 */ }
+        let ok = false
+        try {
+          if (typeof document !== 'undefined' && document.createElement) {
+            const ta = document.createElement('textarea')
+            ta.value = txt; document.body.appendChild(ta); ta.select()
+            ok = !!(document.execCommand && document.execCommand('copy'))
+            document.body.removeChild(ta)
+          }
+        } catch (e) { ok = false }
+        setCopied(ok ? txt : ('手抄：' + txt))
+      }
+      return h('div', { className: 'kcb' },
+        h('div', { className: 'k64' }, '⑨ 学生的提问仓（让另一台机器上的学生提问能到你这儿）'),
+        h('div', { className: 'kd1' }, '给每个学生建一个**只属于他**的私有小仓，他那边点一下就把提问推上来，'
+          + '你这边点一下就能拉进工作区、照常审计。'
+          + '⚠️ 每人一个仓是必须的：学生能推的仓他也能读，"大家共用一个仓"等于全班提问互相可见。'),
+        h('div', { className: 'kce' },
+          h('span', { className: 'k57' }, 'owner'),
+          h('input', {
+            className: 'k61', style: { flex: '1 1 140px', maxWidth: '200px' },
+            value: f.owner || '', placeholder: '你的 GitHub 用户名 / 组织名',
+            onChange: (e) => set({ bulkForm: Object.assign({}, f, { owner: e.target.value }) }),
+          }),
+          h('span', { className: 'k57' }, '仓名前缀'),
+          h('input', {
+            className: 'k61', style: { flex: '1 1 120px', maxWidth: '180px' },
+            value: f.prefix || '', placeholder: '按课程码自动推',
+            onChange: (e) => set({ bulkForm: Object.assign({}, f, { prefix: e.target.value }) }),
+          })),
+        h('div', { className: 'kce' },
+          h('span', { className: 'k57' }, 'Token'),
+          h('input', {
+            className: 'k61', style: { flex: '1 1 220px', maxWidth: '320px' }, type: 'password',
+            value: f.token || '', placeholder: '建私有仓需要 repo 权限（不填就只给你命令）',
+            onChange: (e) => set({ bulkForm: Object.assign({}, f, { token: e.target.value }) }),
+          }),
+          h('span', { className: 'k57' }, 'Token 只在这台机器上、只用于这一次建仓，不写进任何文件，也不下发学生。')),
+        h('div', { className: 'kca' },
+          h('button', { className: 'k42 k11', disabled: st.busy, onClick: onBulk },
+            st.busy ? '处理中…' : '批量建仓（每个学生一个）'),
+          h('span', { className: 'k54' }),
+          h('button', { className: 'k42', disabled: st.busy, onClick: onPull }, '拉学生的提问')),
+        r ? h('div', null,
+          h('div', { className: 'k57', style: { fontWeight: 600 } }, r.note || ''),
+          r.needToken ? h('div', { className: 'kd1' }, '没有 Token（或权限不够）时插件**只生成命令**，不替你建仓 —— '
+            + '装了 GitHub CLI 的话，下面每条命令会在 GitHub 上建一个私有仓：') : null,
+          (r.commands || []).length ? h('div', null,
+            h('pre', { className: 'k39', style: { maxHeight: '180px', overflow: 'auto' } }, r.commands.join('\n')),
+            h('div', { className: 'kca' }, h('button', { className: 'k42', onClick: () => copy(r.commands.join('\n')) },
+              copied === r.commands.join('\n') ? '已复制 ✓' : '复制这些命令'))) : null,
+          rows.map((x) => h('div', { key: x.sid, className: 'kc7' },
+            h('div', { className: 'kc8' },
+              bdg(x.repoError ? '失败' : (x.exists ? '本来就有' : '建好了'),
+                x.repoError ? 'var(--dsw-alias-state-error-primary)' : 'var(--dsw-alias-state-success-primary)'),
+              h('span', { className: 'k64', style: { margin: 0 } }, x.sid + '　' + x.repo),
+              h('span', { className: 'k54' }),
+              h('button', { className: 'k42', onClick: () => copy(x.instruction) },
+                copied === x.instruction ? '已复制 ✓' : '复制发给他的说明')),
+            x.repoError ? h('div', { className: 'k57', style: { color: 'var(--dsw-alias-state-error-primary)' } }, x.repoError) : null,
+            x.inviteError ? h('div', { className: 'k57', style: { color: 'var(--dsw-alias-state-warn-primary)' } },
+              '（仓建好了，但邀请没成功：' + x.inviteError + ' —— 下次重跑会补上）') : null,
+            x.invited ? h('div', { className: 'k57' }, '已邀请 ' + x.login + ' 为协作者（**他要接受之后**才推得上来）') : null))) : null,
+        pulled ? h('div', { className: 'kd1' },
+          pulled.text || '',
+          pulled.conflictNote ? h('div', { className: 'k57', style: { marginTop: '4px' } }, pulled.conflictNote) : null,
+          (pulled.students || []).filter((x) => x.conflicts && x.conflicts.length).map((x) => h('div', {
+            key: x.sid, className: 'k57',
+          }, '· ' + x.sid + '：' + x.conflicts.join('、') + '（你这边改过，**没动**）')),
+          (pulled.students || []).filter((x) => x.error).map((x) => h('div', {
+            key: 'e' + x.sid, className: 'k57', style: { color: 'var(--dsw-alias-state-error-primary)' },
+          }, '· ' + x.sid + '：' + x.error)),
+          pulled.hint ? h('div', { className: 'k57' }, pulled.hint) : null) : null)
+    }
+
+    /**
      * 「归档与发布」这一页的顺序是**照老师的问题顺序**排的：
      *   ① 现在能不能发出去 → ② 不能的话差哪一步（建仓 / 连 remote）→ ③ 发布并推送
      *   → ④ 学生该克隆哪一份（版本）→ ⑤ 学生能下载/在线看什么（资料）
@@ -691,7 +793,7 @@ window.__ModuleLoader__.load({
      *
      * 每一块各自套一个错误边界：一块崩了不该让整页红屏（学生端踩过这个坑）。
      */
-    function Publish({ st, set, onRefresh, onPublish, onPlan, onRepoStatus, onRepoInit, onLoadVersion, onCompareVersion, onLoadMaterials, onSyncStatus, onCopyCmd }) {
+    function Publish({ st, set, onRefresh, onPublish, onPlan, onRepoStatus, onRepoInit, onLoadVersion, onCompareVersion, onLoadMaterials, onSyncStatus, onCopyCmd, onBulk, onPullInbox }) {
       const s = st.staged
       return h('div', { className: 'k46' },
         h('div', { className: 'k64' }, '归档与发布'),
@@ -712,6 +814,9 @@ window.__ModuleLoader__.load({
         //    而第四步过去**这一页根本不提** —— 这就是老师实测出来「同事看得到、
         //    我看不到」的直接成因（管道接好了，但没有任何地方告诉他按哪里）。
         h(PanelBoundary, { label: '问题池同步' }, h(SyncCard, { st, onSync: onSyncStatus, onCopy: onCopyCmd })),
+        // ⑨ 学生的提问仓（方案 A）。放在最后是因为它是**一次性设置**：
+        // 建好全班之后，日常只用到一句「拉学生的提问」。
+        h(PanelBoundary, { label: '学生的提问仓' }, h(StudentRepos, { st, set, onBulk, onPull: onPullInbox })),
         h('div', { className: 'k64' }, '⑦ 材料归位'),
         h(PanelBoundary, { label: '材料归位' }, h(MaterialsTable, { st, set, onPlan })),
         h('div', { className: 'k64' }, '⑧ 待发布清单（发之前会带哪些东西）'),
@@ -2486,6 +2591,33 @@ window.__ModuleLoader__.load({
           await loadAll()
         } catch (err) { set({ busy: false, error: '切课失败：' + ((err && err.message) || String(err)) }) }
       }, [])
+      // ── 学生提问仓（方案 A 第①③步）──
+      /**
+       * ⚠️ token **不进 state 之外的任何地方**：`bulkForm.token` 是这个页面的
+       *    本地输入，发出去一次就完了 —— 不写文件、不进日志、不回传（宿主那边也守着）。
+       *    表单本身不清空（老师可能要点两次重跑失败的几个）。
+       */
+      const onBulkRepos = React.useCallback(async () => {
+        const f = (stRef.current && stRef.current.bulkForm) || {}
+        set({ busy: true, error: '', notice: '' })
+        try {
+          const r = await api('repo.bulkInit', {
+            owner: f.owner, prefix: f.prefix, token: f.token,
+            invite: true,
+          })
+          if (r && r.ok === false) throw new Error(r.error || '建仓被拒了')
+          set({ busy: false, bulkRepos: r, notice: r.note || '批量建仓完成' })
+        } catch (err) { set({ busy: false, error: '批量建仓失败：' + ((err && err.message) || String(err)) }) }
+      }, [])
+      const onPullInbox = React.useCallback(async () => {
+        set({ busy: true, error: '', notice: '' })
+        try {
+          const r = await api('question.pullInbox', {})
+          set({ busy: false, inboxResult: r, notice: r.text || '' })
+          // 新进来的提问要立刻出现在「提问与审计」里 —— 不重拉的话老师会以为没拉到
+          if (r && r.copied) { await loadThreads(); await loadAll() }
+        } catch (err) { set({ busy: false, error: '拉学生的提问失败：' + ((err && err.message) || String(err)) }) }
+      }, [])
       const loadAll = React.useCallback(async () => {
         try {
           const info = await api('info', {})
@@ -2762,6 +2894,37 @@ window.__ModuleLoader__.load({
       // 顶栏每一页都要显示"现在是哪一门、公开仓是哪一个"，而那两个动作都只读盘。
       React.useEffect(() => { loadCourseInfo() }, [loadCourseInfo])
       React.useEffect(() => { loadCourseOptions() }, [loadCourseOptions])
+      // ── 自动更新 ────────────────────────────────────────────────────
+      /**
+       * 与**学生端同一套**（老师要的是「使用期间十分钟一次，重新启用时自动更新」）。
+       *
+       * ⚠️ 三条安全约束都由宿主保证（core 的 updateState / updatePull）：
+       *    只快进、有未提交改动时**一步都不动**、失败只提示不报红。
+       *    这一条对老师尤其要紧 —— 他的工作区里可能正躺着一份没写完的教案草稿，
+       *    自动 pull 撞上它要么失败要么产生 merge，两种都不可接受。
+       *
+       * ⚠️ 老师这边**只拉不推**：推要用凭据，那是他照抄命令去做的事（发布页给的就是命令）。
+       */
+      const runUpdate = React.useCallback(async () => {
+        try {
+          const s = await api('update.status', {})
+          set({ updateInfo: s })
+          if (s && s.canPull) {
+            const r = await api('update.pull', {})
+            set({ updateInfo: r })
+            if (r && r.pulled) {
+              set({ notice: '课程仓已更新（远端有 ' + s.behind + ' 个新提交）。' })
+              await loadAll()
+            }
+          }
+        } catch (err) { /* 不打扰用户：宿主那边已经把它变成一句人话了 */ }
+      }, [])
+      React.useEffect(() => { runUpdate() }, [runUpdate])
+      React.useEffect(() => {
+        // ⚠️ 卸载时必须 clearInterval（同学生端那处注释）
+        const t = setInterval(() => { runUpdate() }, 10 * 60 * 1000)
+        return () => clearInterval(t)
+      }, [runUpdate])
 
       const views = [
         { id: 'questions', label: '提问与审计' },
@@ -2883,6 +3046,8 @@ window.__ModuleLoader__.load({
                 onLoadMaterials: loadMaterials,
                 // 问题池同步：读状态（spawn git，只在点按钮时走）、复制命令
                 onSyncStatus: loadSyncStatus, onCopyCmd,
+                // 学生的提问仓（方案 A）：批量建仓 + 拉学生的提问
+                onBulk: onBulkRepos, onPullInbox,
               })) : null,
             // 每个视图各自一个错误边界：一个视图崩了不该把整页变成红屏
             // （学生端踩过：一个视图调错函数，整块面板全红）。

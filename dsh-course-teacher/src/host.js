@@ -84,6 +84,11 @@ export async function apply(ctx) {
     // 它唯一的去处是「显示给老师自己敲」的那条命令。readRepoState() 的返回已经脱敏，
     // 界面拿到的 remote 永远不含凭据（这条踩过两次，见 repo.js 里的注释）。
     repoSlug, readRepoState, repoSummary, manualSteps, remoteUrl,
+    // 批量建「学生提问仓」用的请求体构造（纯函数，构建门逐字段测过）。
+    // ⚠️ 必须是 repo.js 那一份，**不许在动作体里现拼** —— 里面有两个关键字段
+    //    是踩过坑才定下来的（`auto_init:false`：不能让 GitHub 先建 README，
+    //    否则首推要先 pull --rebase，而学生不懂 rebase；`private:true`）。
+    createRepoBody,
     // 两位老师之间的「问题池同步」要用：让 git 在**图上**算领先/落后，
     // 并把 porcelain 输出变成"哪几个文件"。判据都在 repo.js 里，只有一份。
     parseAheadBehind, parseChangedPaths, COURSE_DATA_RE,
@@ -100,6 +105,71 @@ export async function apply(ctx) {
   } = C
 
   const TEACHER = safeId(process.env.CIP_TEACHER || process.env.USERNAME || 'teacher') || 'teacher'
+
+  /**
+   * clone / pull 失败时说人话（**学生那一边的地址**，不是老师自己的仓）。
+   *
+   * ⚠️ 只用参数与 `node:*`：模块级辅助函数**不能**碰 `apply()` 里解构出来的东西
+   *    （`runOutput` / `runCaptured` 都在那个作用域里）。这一条在学生端已经踩过三次，
+   *    所以这里直接把**已经取好的文本**收进来。
+   *
+   * 三种成因对应三种完全不同的动作，混在一起说等于没说：
+   *   · 仓不存在 / 没权限 → 多半是学生**还没接受邀请**（这是最常见的一种，而且
+   *     老师完全想不到 —— 他会以为是自己建仓建坏了）；
+   *   · 连不上 → 网络，重试有用；
+   *   · 别的 → 把原文给他。
+   */
+  function explainGitFail(raw, login) {
+    const text = String(raw || '')
+    if (/could not read username|authentication failed|repository not found|403|404/i.test(text)) {
+      return '拉不到这个仓（' + (login ? ('学生账号 ' + login) : '学生账号没填') + '）。'
+        + '最常见的原因是**学生还没接受 GitHub 的邀请** —— 邀请要他在邮箱里点 Accept 之后才生效。'
+        + '其次确认一下建仓时填的 GitHub 用户名是不是写对了。'
+    }
+    if (/could not resolve|unable to access|connection|timed out|reset|connect/i.test(text)) {
+      return '连不上 GitHub（网络问题）—— 网络好了再点一次，已经拉下来的不会重来。'
+    }
+    return '拉不下来：' + (text ? text.slice(-300) : '没有输出')
+  }
+
+  /**
+   * ── GitHub 接口（只给「批量建学生提问仓」用）───────────────────────────
+   *
+   * ⚠️ 与 `repo.init` 那条口径**不冲突**，因为它们做的是两件不同的事：
+   *   · `repo.init` 是老师**自己的仓**：token 是他手填进表单的，插件经手了，
+   *     所以只做到「本机准备好」，GitHub 上那一步给他命令自己敲；
+   *   · 这里是老师**替全班建 30 个仓**：一个一个手点是不现实的（老师原话里
+   *     「跨机器的协调」最难的就是这一堆手工步骤），所以这一步必须自动化。
+   *     同一个 token，同样只在这一个请求的内存里用一次，**不落盘、不进日志**。
+   *
+   * 三条纪律：
+   *   ① **绝不把 token 写进任何返回**（连脱敏后的都不要 —— 判据落在整个返回值上）；
+   *   ② 网络失败一律 `{ ok:false }`，**不抛**：批量操作里抛一个异常会让前 7 个
+   *      已经建好的仓白建（老师不知道进行到哪了）；
+   *   ③ **幂等**：仓已存在（422）当成成功（`exists:true`）—— 重跑一次是老师的
+   *      常规动作（新来了一个学生、上次第 12 个失败了），不能因为"已存在"就报错。
+   */
+  async function ghApi(token, method, apiPath, body) {
+    try {
+      const res = await fetch('https://api.github.com' + apiPath, {
+        method,
+        headers: Object.assign({
+          Authorization: 'Bearer ' + token,
+          Accept: 'application/vnd.github+json',
+          'X-GitHub-Api-Version': '2022-11-28',
+          'User-Agent': 'dsh-course-teacher',
+        }, body ? { 'Content-Type': 'application/json' } : {}),
+        body: body ? JSON.stringify(body) : undefined,
+      })
+      let json = null
+      try { json = await res.json() } catch (e) { json = null }
+      return { ok: res.status >= 200 && res.status < 300, status: res.status, json }
+    } catch (e) {
+      // 网络层的失败（离线、代理）与 HTTP 层的失败要分开说：
+      // 前者重试有用，后者要改输入。混在一起老师只能靠猜。
+      return { ok: false, status: 0, netError: String((e && e.message) || e), json: null }
+    }
+  }
 
   /**
    * 显示名解析器。**每次现读名册**，不缓存 ——
@@ -782,6 +852,323 @@ export async function apply(ctx) {
           + '不在同步范围内，上面那条 add 也不会带上它们。）'
       }
       return out
+    },
+
+    /**
+     * ── 批量建「学生提问仓」（方案 A 的第①步）────────────────────────────
+     *
+     * 老师原话里的难点是**跨机器的协调**。而协调里最脏的一段是：
+     * 30 个学生，每人要有一个**只有他和你**能看到的仓 —— 手点 30 次建仓 +
+     * 30 次加 collaborator + 30 条不同的说明，这件事没人会做第二遍。
+     * 这个动作就是把它变成一次点击。
+     *
+     * ⚠️ **为什么必须每人一个仓**（这是 Git 的权限模型，不是实现选择）：
+     *    任何学生能 push 的仓库他同时也能 clone 下来读。所以"大家推同一个仓"
+     *    意味着学生 A 能读到学生 B 的全部提问 —— 比公开更糟，因为大家以为它是私密的。
+     *
+     * ⚠️ 仓里**不放课程工作区**（只有一个 `课程问题池/`）：克隆快，
+     *    而且学生拿到的是"只属于他"的地方 —— 心理上他更敢问蠢问题。
+     *
+     * 输入：`{ token, owner, prefix, students:[{sid, login}], invite }`
+     *   · `prefix` 默认按课程码折出来（`repoSlug`），仓名是 `<prefix>-q-<学号>`；
+     *   · `login` 是学生的 GitHub 用户名；给了就邀请为 collaborator（push 权限）；
+     *   · `invite:false` 可以只建仓不邀请（想先把仓建好、账号以后再收）。
+     *
+     * 没给 token 时**不报错**：返回 `needToken:true` + 一份可以照抄的命令清单 ——
+     * 老师手上有 token 权限不够（比如只有 public_repo）时，这是唯一的出路，
+     * 而那条路必须真的走得通，不能只是一句"请提供 token"。
+     */
+    async 'repo.bulkInit'(args) {
+      const input = args && typeof args === 'object' ? args : {}
+      const fsMod = await import('node:fs')
+      const nodePath = await import('node:path')
+      const token = String(input.token === undefined || input.token === null ? '' : input.token).trim()
+      const info = core.info()
+      const course = info.course || {}
+      const owner = oneLine(input.owner)
+      const prefix = repoSlug(oneLine(input.prefix) || course.code || course.title || '', 'course')
+      const wantInvite = input.invite !== false
+
+      if (!/^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/.test(owner)) {
+        return {
+          ok: false,
+          error: 'owner 要填 GitHub 用户名或组织名（只能英文字母、数字、横线）。现在填的是「'
+            + (owner || '（空）') + '」—— 它会被原样拼进 30 个仓库地址，拼错了每个都只会回 404。',
+        }
+      }
+
+      // 学生名单：客户端可以只给 sid（名册里那些人），也可以带上 GitHub 用户名
+      let list = Array.isArray(input.students) ? input.students : []
+      if (!list.length) {
+        const roster = readRoster(core)
+        const students = new Set(Object.keys(roster.students || {}))
+        try { for (const it of await core.listItems()) if (it && it.student) students.add(it.student) } catch (e) { /* 读不到提问就只按名册 */ }
+        list = [...students].sort().map((sid) => ({ sid, login: '' }))
+      }
+      list = list.map((x) => ({
+        sid: safeId(oneLine(x && x.sid)) || '',
+        login: oneLine(x && x.login).replace(/^@/, ''),
+      })).filter((x) => x.sid)
+      if (!list.length) {
+        return { ok: false, error: '名单是空的 —— 先在「学生」页把名册弄好，或者手工把学号填进来。' }
+      }
+
+      /** 每个学生的仓名与地址（**纯计算**，与有没有 token 无关 —— 两档都要用）。 */
+      const plan = list.map((x) => {
+        // ⚠️ 学号要过 repoSlug：GitHub 仓名只允许 [A-Za-z0-9._-]，
+        //    而学号里常常有别的字符（中文、括号）。不过这一道，
+        //    建仓请求会被 GitHub 回 422，老师看到的是"名字不合法"却不知道是哪个学生的。
+        const repo = repoSlug(prefix + '-q-' + x.sid, prefix + '-q-student')
+        return { sid: x.sid, login: x.login, repo, url: 'https://github.com/' + owner + '/' + repo + '.git' }
+      })
+
+      /** 发给**某一个学生**的那一条（一人一条，不写在一个大群里）。 */
+      const instructionFor = (p) => [
+        '【' + (course.title || '本课程') + ' · 你的提问仓库】',
+        '你的专属仓库（只有你和我能看到，别的同学看不到你的提问）：',
+        p.url,
+        '',
+        '怎么用：打开课程面板（学生端）→ 顶栏「课程」旁边的设置里填这个地址 →',
+        '点「把我的提问交上去」。第一次会让你登录 GitHub，之后就不用再管了。',
+      ].join('\n')
+
+      // ── 没有 token：给一份能照抄的命令（这条路必须真的走得通）──────────
+      if (!token) {
+        return {
+          ok: true, needToken: true, mode: 'manual', owner, prefix,
+          students: plan.map((p) => Object.assign({}, p, { instruction: instructionFor(p) })),
+          commands: plan.map((p) => 'gh repo create ' + owner + '/' + p.repo + ' --private'
+            + (wantInvite && p.login ? (' --add-collaborator ' + p.login) : '')),
+          note: '没给 token（或者权限不够），所以这次**只生成命令**，没有替你建仓。'
+            + '装了 GitHub CLI（`gh`）的话，上面每条命令会在 GitHub 上建一个私有仓；'
+            + '没装 `gh` 也可以照着在网页上点 30 次 —— 但那就是这件事最脏的一段。',
+        }
+      }
+
+      // ── 有 token：真的建 ────────────────────────────────────────────
+      const results = []
+      for (const p of plan) {
+        const row = Object.assign({}, p, {
+          created: false, exists: false, invited: false, inviteError: '', repoError: '',
+          instruction: instructionFor(p),
+        })
+        const mk = await ghApi(token, 'POST', '/user/repos', createRepoBody(p.repo, {
+          private: true,
+          description: (course.title || '课程') + ' · 学生提问（' + p.sid + '）',
+        }))
+        if (mk.ok) row.created = true
+        else if (mk.status === 422) row.exists = true   // 已存在 = 老师的常规重跑，不是错
+        else if (mk.netError) row.repoError = '连不上 GitHub（' + mk.netError + '）—— 网络好了再点一次，已经建好的不会重来。'
+        else {
+          const msg = oneLine(mk.json && mk.json.message ? mk.json.message : '（没有说明）')
+          /**
+           * 按**状态码**分别给话，不要只塞一句 git/GitHub 的原文。
+           * ⚠️ 第一版只匹配 `scope|permission|Forbidden`，而 GitHub 对
+           *    "token 权限不够"回的原文是 `Resource not accessible by personal access token` ——
+           *    一个词都不中，于是最需要提示的那一档**一句提示都没有**。
+           *    判据要落在**状态码**上（它才是稳定的），原文只用来分辨 403 的两种成因。
+           */
+          let hint = ''
+          if (mk.status === 401 || /bad credentials/i.test(msg)) {
+            hint = '　token 不对或者过期了 —— 重新生成一个再填进来。'
+          } else if (mk.status === 403 || /scope|permission|not accessible|forbidden/i.test(msg)) {
+            hint = '　多半是这个 token 权限不够：建私有仓需要 `repo` 权限。'
+          } else if (mk.status === 404) {
+            hint = '　owner 写错了？GitHub 对你没权限的东西也回 404。'
+          }
+          row.repoError = 'HTTP ' + mk.status + '：' + msg + hint
+        }
+        if ((row.created || row.exists) && wantInvite && p.login) {
+          const iv = await ghApi(token, 'PUT',
+            '/repos/' + owner + '/' + p.repo + '/collaborators/' + encodeURIComponent(p.login),
+            { permission: 'push' })
+          if (iv.ok) row.invited = true
+          // 邀请失败**不算这个学生的仓失败**：仓建好了，账号写错可以下次重跑补上。
+          // 所以分开记，界面上也分开显示（否则老师会把"邀请失败"当成"仓没建成"）。
+          else row.inviteError = iv.status === 404
+            ? ('GitHub 上找不到用户 `' + p.login + '`（用户名拼错了？）')
+            : ('邀请失败 HTTP ' + iv.status + '：' + oneLine((iv.json && iv.json.message) || '（没有说明）'))
+        }
+        results.push(row)
+      }
+
+      // 落一份清单给第③步用（老师这台机器上的私有数据，跟着工作区走）
+      const regRel = '课程发布/学生提问仓.json'
+      const regPath = nodePath.join(core.WORKSPACE, regRel)
+      let reg = null
+      try { reg = JSON.parse(fsMod.readFileSync(regPath, 'utf8')) } catch (e) { reg = null }
+      const next = {
+        _说明: '每个学生的私有提问仓。由教师端「批量建仓」写入，供「拉学生的提问」使用。'
+          + '这份文件在老师的工作区里，不下发学生。',
+        owner, prefix, updatedAt: new Date().toISOString(),
+        students: Object.assign({}, (reg && reg.students) || {}),
+      }
+      for (const r of results) {
+        next.students[r.sid] = {
+          login: r.login || (reg && reg.students && reg.students[r.sid] && reg.students[r.sid].login) || '',
+          repo: r.repo, url: r.url,
+          ready: !!(r.created || r.exists),
+        }
+      }
+      let regSaved = false
+      let regError = ''
+      try {
+        fsMod.mkdirSync(nodePath.dirname(regPath), { recursive: true })
+        fsMod.writeFileSync(regPath, JSON.stringify(next, null, 2), 'utf8')
+        regSaved = true
+      } catch (e) { regError = String((e && e.message) || e) }
+
+      const made = results.filter((r) => r.created).length
+      const existed = results.filter((r) => r.exists).length
+      const failed = results.filter((r) => r.repoError).length
+      const invited = results.filter((r) => r.invited).length
+      return {
+        ok: true, mode: 'api', owner, prefix, students: results,
+        registryFile: regSaved ? regRel : '', registryError: regError,
+        note: '建好 ' + made + ' 个新仓' + (existed ? ('、' + existed + ' 个本来就有') : '')
+          + (failed ? ('、**' + failed + ' 个失败**（下面逐个写了原因）') : '')
+          + '；邀请 ' + invited + ' 个学生成为协作者。'
+          + (regSaved ? '' : '　⚠️ 清单没写进 ' + regRel + '（' + regError + '），下次要重新填一遍。')
+          // 提醒一句最容易被忽略的事：邀请要学生**点接受**才生效
+          + (invited ? '　⚠️ GitHub 会给学生发邀请，**他要接受之后**才推得上来。' : ''),
+      }
+    },
+
+    /**
+     * ── 拉学生的提问（方案 A 第③步）─────────────────────────────────────
+     *
+     * 这是整个闭环里**最后一段**：学生在自己机器上点了「交上去」，
+     * 老师这边点一下，那些提问就出现在他的工作区里，然后走**现有的审计流程**。
+     *
+     * 按 `课程发布/学生提问仓.json`（第①步写的清单）逐个处理：
+     *   ① 本地收件箱 `~/.dsh/student-inbox/<学号>/`：没有就 clone，有就 `pull --ff-only`；
+     *   ② 把收件箱里的文件**新增**到工作区 `课程问题池/学生/<学号>/`。
+     *
+     * ⚠️⚠️ **只新增，绝不覆盖** —— 这一条是整个方案里最容易毁数据的地方：
+     *    老师的**答复就写在同一个文件里**（`<某条提问>.thread.json` 的对话线程，
+     *    由审计/答复那条路写进工作区的副本）。学生的那个仓里**没有**老师的答复。
+     *    如果这里按"以远端为准"覆盖一遍，老师**答复过的每一条都会被冲掉** ——
+     *    而且不报错、不可恢复（他下次打开才发现答复没了）。
+     *    所以：内容相同的跳过；**内容不同的一律不动**，记成 `conflict` 列给老师看。
+     *    代价是"学生后来又追问了同一题"这一轮不会自动进来 ——
+     *    这个代价是**明说出来的**（返回里的 `conflictNote`），不是静默的。
+     *
+     * ⚠️ 收件箱**不放工作区里**（理由同学生端的提问仓）：嵌套 git 仓在工作区里
+     *    会被 `.gitignore` 漏掉、被发布工具扫到、被老师自己 `git add -A` 推错地方。
+     */
+    async 'question.pullInbox'(args) {
+      const input = args && typeof args === 'object' ? args : {}
+      const fsMod = await import('node:fs')
+      const nodePath = await import('node:path')
+      const nodeOs = await import('node:os')
+      const inboxRoot = process.env.CIP_INBOX_DIR || nodePath.join(nodeOs.homedir(), '.dsh', 'student-inbox')
+
+      // 清单：第①步写的那份。没有它就没法知道该拉谁的。
+      const regPath = nodePath.join(core.WORKSPACE, '课程发布', '学生提问仓.json')
+      let reg = null
+      try { reg = JSON.parse(fsMod.readFileSync(regPath, 'utf8')) } catch (e) { reg = null }
+      const all = (reg && reg.students) || {}
+      let sids = Object.keys(all).filter((s) => all[s] && all[s].ready && all[s].url)
+      if (Array.isArray(input.only) && input.only.length) {
+        const want = input.only.map((x) => oneLine(x))
+        sids = sids.filter((s) => want.indexOf(s) >= 0)
+      }
+      if (!Object.keys(all).length) {
+        return {
+          ok: true, needBuild: true, students: [], copied: 0, conflicts: 0,
+          text: '还没有「学生提问仓」清单 —— 所以没有谁的可以拉。',
+          hint: '先在发布页点「批量建仓」（它会建好每个学生的私有小仓并记下清单）。',
+        }
+      }
+      if (!sids.length) {
+        return {
+          ok: true, students: [], copied: 0, conflicts: 0,
+          text: '清单里有 ' + Object.keys(all).length + ' 个学生，但一个可拉的都没有'
+            + '（建仓失败的、或者还没填 GitHub 账号的会被标成不可拉）。',
+          hint: '回到「批量建仓」看看哪几个失败了 —— 修好之后它会补上清单。',
+        }
+      }
+
+      let gitBinPath = ''
+      if (fsMod.existsSync(GIT_HARD_PATH)) gitBinPath = GIT_HARD_PATH
+      else {
+        const probe = runCaptured('git', ['--version'], { timeout: 20000, hintDir: core.WORKSPACE })
+        if (!probe.error && runExitCode(probe) === 0) gitBinPath = 'git'
+      }
+
+      const poolDir = core.courseAbs ? core.courseAbs('课程问题池') : nodePath.join(core.WORKSPACE, '课程问题池')
+      const rows = []
+      let copiedTotal = 0
+      let conflictTotal = 0
+
+      for (const sid of sids) {
+        const row = { sid, login: all[sid].login || '', url: all[sid].url, mode: '', copied: 0, conflicts: [], skipped: 0, error: '' }
+        const inbox = nodePath.join(inboxRoot, sid)
+        const dest = nodePath.join(poolDir, '学生', sid)
+        if (!gitBinPath) {
+          row.error = '这台机器上跑不了 git —— 拉不下来。装上 Git for Windows 再试。'
+          rows.push(row); continue
+        }
+        // ① 收件箱：clone 或 pull --ff-only（**绝不 merge**：这里没有需要合并的历史）
+        //
+        // ⚠️ `CIP_INBOX_SKIP_FETCH=1` 是**给断言用的口子**（与本项目其它测试口子同一套做法：
+        //    CIP_GIT_BIN / CIP_WORKSPACE_FILE / CIP_CLONE_TIMEOUT_MS）。没有它，
+        //    下面那一段"只新增不覆盖"的逻辑在沙箱里**永远走不到** ——
+        //    因为 git 的传输栈起不来（见交接文档四之三十七），clone/pull 必然失败。
+        //    而"只新增不覆盖"恰恰是这一步**唯一会毁数据**的地方（它护着老师的答复），
+        //    一条测不到的守门逻辑等于没写。所以给一个口子，让那一段能被真的跑到。
+        const skipFetch = process.env.CIP_INBOX_SKIP_FETCH === '1'
+        if (skipFetch) {
+          row.mode = 'skip-fetch'
+        } else if (!fsMod.existsSync(nodePath.join(inbox, '.git'))) {
+          try { fsMod.mkdirSync(nodePath.dirname(inbox), { recursive: true }) } catch (e) { /* 已存在 */ }
+          try { fsMod.rmSync(inbox, { recursive: true, force: true }) } catch (e) { /* 不存在 */ }
+          const cl = runCaptured(gitBinPath, ['clone', row.url, inbox], { timeout: 300000, hintDir: nodePath.dirname(inbox) })
+          if (runExitCode(cl) !== 0) { row.error = explainGitFail(runOutput(cl), row.login); rows.push(row); continue }
+          row.mode = 'clone'
+        } else {
+          const pl = runCaptured(gitBinPath, ['--no-optional-locks', '-C', inbox, 'pull', '--ff-only'],
+            { timeout: 180000, hintDir: inbox })
+          if (runExitCode(pl) !== 0) { row.error = explainGitFail(runOutput(pl), row.login); rows.push(row); continue }
+          row.mode = 'pull'
+        }
+        // ② 新增进工作区（**只新增**，见上面那段长注释）
+        let names = []
+        try {
+          names = fsMod.readdirSync(inbox, { withFileTypes: true }).filter((e) => e.isFile() && e.name[0] !== '.').map((e) => e.name)
+        } catch (e) { row.error = '读不到收件箱：' + oneLine((e && e.message) || e); rows.push(row); continue }
+        try { fsMod.mkdirSync(dest, { recursive: true }) } catch (e) { /* 已存在 */ }
+        for (const name of names) {
+          const from = nodePath.join(inbox, name)
+          const to = nodePath.join(dest, name)
+          let same = false
+          try {
+            const a = fsMod.readFileSync(from)
+            const b = fsMod.existsSync(to) ? fsMod.readFileSync(to) : null
+            if (b && a.equals(b)) same = true
+            else if (!b) { fsMod.copyFileSync(from, to); row.copied += 1; copiedTotal += 1; continue }
+          } catch (e) { row.skipped += 1; continue }
+          if (same) { row.skipped += 1; continue }
+          // 两边都有、内容不同 → **不动它**，记下来
+          row.conflicts.push(name)
+          conflictTotal += 1
+        }
+        rows.push(row)
+      }
+
+      const okCount = rows.filter((r) => !r.error).length
+      return {
+        ok: true, students: rows, inboxRoot,
+        copied: copiedTotal, conflicts: conflictTotal, okCount,
+        text: '拉了 ' + okCount + ' / ' + rows.length + ' 个学生：新进来 ' + copiedTotal + ' 条提问'
+          + (conflictTotal ? ('，另有 ' + conflictTotal + ' 个文件两边都改过（**没有动它们**）') : '') + '。',
+        // ⚠️ 冲突这一档必须说出来，不能让它静默地"少了几条"
+        conflictNote: conflictTotal
+          ? '那 ' + conflictTotal + ' 个文件在你这边已经被改过（多半是你答复过），所以**没有覆盖** ——'
+            + '覆盖会把你的答复冲掉。它们在下面逐个列出来了，需要的话手工看一眼。'
+          : '',
+        hint: copiedTotal ? '新进来的提问会出现在「提问与审计」里，照常审计就行。' : '',
+      }
     },
 
     /**

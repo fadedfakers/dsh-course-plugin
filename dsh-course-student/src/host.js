@@ -11,7 +11,81 @@
  * 因此每次调用都把 token 用量记进条目，面板里能看见自己花了多少。
  */
 import path from 'node:path'
+import os from 'node:os'
+import fs from 'node:fs'
 import { loadCore, PLUGIN_ROOT } from './core-loader.js'
+
+/**
+ * ── 「我的提问仓库」（方案 A 第②步）的几个落点 ──────────────────────────
+ *
+ * 三个东西分开放在三个地方，各有各的理由：
+ *   · 仓地址 `~/.dsh/cip-question-repo.txt` —— **本机配置**，不进任何仓库。
+ *     与 `cip-workspace.txt` 同一个做法（同样的理由：换机器要重配，而不是跟着仓走）。
+ *   · 本地克隆 `~/.dsh/q-repo/` —— **不放工作区里**。放进去的话它会被课程仓的
+ *     `.gitignore` 漏掉、被发布工具扫到、被学生自己 `git add -A` 推错地方 ——
+ *     一个嵌套 git 仓在工作区里是纯粹的麻烦。
+ *   · 提问本体仍在工作区的 `课程问题池/学生/<学号>/`（面板正常读它），
+ *     这一份只是**推上去的副本**。
+ */
+const Q_REPO_DIR = process.env.CIP_QREPO_DIR || path.join(os.homedir(), '.dsh', 'q-repo')
+function qRepoFile() {
+  return process.env.CIP_QREPO_FILE || path.join(os.homedir(), '.dsh', 'cip-question-repo.txt')
+}
+/** 读仓地址：环境变量优先（测试与临时覆盖），其次配置文件。 */
+function readQRepoUrl() {
+  const env = String(process.env.CIP_QREPO || '').trim()
+  if (env) return env
+  try {
+    for (const raw of fs.readFileSync(qRepoFile(), 'utf8').split(/\r?\n/)) {
+      const line = raw.trim()
+      if (line && line[0] !== '#') return line
+    }
+  } catch (e) { /* 没有就是没有 */ }
+  return ''
+}
+const fsExists = (p) => { try { return fs.existsSync(p) } catch (e) { return false } }
+/**
+ * git 在哪：先试写死的路径，再回落 PATH。
+ * ⚠️ 探活**必须**由调用方传一个 probe 进来：`runCaptured` 是 `apply()` 里从 core
+ *    解构出来的，模块级作用域里没有它。第一版在模块级直接调它 —— 那是
+ *    `runCaptured is not defined`，而且只在学生第一次点「交上去」时才炸。
+ */
+function findGit(probe) {
+  if (fsExists('D:\\Git\\cmd\\git.exe')) return 'D:\\Git\\cmd\\git.exe'
+  return probe() ? 'git' : ''
+}
+
+/**
+ * 推送失败时说人话。
+ *
+ * ⚠️ `raw` 是**已经取好的输出文本**，不是 runCaptured 的返回值 ——
+ *    因为 `runOutput()` 是 `apply()` 里从 core 解构出来的，模块级作用域里没有它。
+ *    这个函数第一版直接收了 `r` 再自己调 `runOutput(r)`，于是每次推送失败都变成
+ *    `runOutput is not defined` —— 而学生看到的是"未知错误"。
+ *    **同一个文件里这一类错已经犯了三次**（`findGit` / `findGit` 的探活 / 这里）：
+ *    凡是模块级的辅助函数，只能用它自己的参数与 `node:*`，不能用 `apply` 里的东西。
+ */
+function qPushFail(out, step, raw, url) {
+  out.level = step + '-failed'
+  out.output = String(raw || '').slice(-1500)
+  const text = String(raw || '')
+  const offline = /could not resolve|unable to access|connection|timed out|reset|connect/i.test(text)
+  const auth = /authentication|403|permission denied|could not read username|repository not found/i.test(text)
+  if (offline && !auth) {
+    out.text = '连不上 GitHub —— 提问还在你本机，没有丢。'
+    out.hint = '换个网络（或者等一会儿）再点一次「交上去」。'
+  } else if (auth) {
+    out.text = 'GitHub 那边没让你进 —— 提问还在你本机，没有丢。'
+    out.hint = '两种可能：① 老师发的邀请你还没**接受**（去邮箱里找 GitHub 的邀请邮件，点 Accept）；'
+      + '② 你登录的 GitHub 账号不是老师拉进仓库的那个。确认之后重试一次，'
+      + '第一次会弹登录窗口，登进去以后就不用再登了。'
+  } else {
+    out.text = '没交上去（' + step + ' 这一步）—— 提问还在你本机，没有丢。'
+    out.hint = '把下面那段原样发给老师，他那边能看到原因。'
+  }
+  out.url = url
+  return out
+}
 
 export const name = 'course-panel-student'
 export const inject = ['webServer']
@@ -44,6 +118,9 @@ export async function apply(ctx) {
     // 起子进程并**收回输出**（拉取更新要跑 git）。不能用带 encoding 的 spawnSync：
     // 沙箱不给管道，那种写法一律 EPERM 且不抛异常（详见 core/src/run.js）。
     runCaptured, runOutput, runExitCode,
+    // 把 `git status --porcelain` 变成"哪几个文件"（提问仓库推之前要判断有没有新东西）。
+    // 与教师端「问题池同步」用的是**同一个解析器** —— 只有一份，不会两边漂移。
+    parseChangedPaths,
     // 人的身份：本机学号 / 学生自报 / 老师名册
     readIdentity, writeIdentity, resolveStudentId, IDENTITY_REL,
     readRoster, readStudentInfo, writeStudentInfo, nameOf, labelOf, moveStudent,
@@ -371,6 +448,142 @@ export async function apply(ctx) {
      * 所以分两步：第一次调用只回报「会搬多少东西」，带 confirm 才真搬。
      */
     async 'student.me'() { return describeMe() },
+
+  /**
+   * ── 把我的提问交上去（方案 A 第②步）────────────────────────────────────
+   *
+   * 老师说清了要什么：「学生端的提问，要能在另一台机器上的教师端看到」。
+   *
+   * ⚠️ **为什么不是把工作区 push 上去**（这是最容易走错的一步）：
+   *    学生的工作区是**课程公开仓的 clone**，而他：
+   *      ① 对那个仓没有写权限（有的话他一次误操作就能改掉整个课程仓）；
+   *      ② 那个仓的 `.gitignore` **故意忽略** `课程问题池/`（防的就是"一次
+   *         `git add -A` 把全班提问推上公开仓"）。
+   *    所以这里用的是**第二个仓**：老师给他建的那个专属私有小仓。
+   *    本机落点是 `~/.dsh/q-repo/`，仓里**只有他的提问**（没有课程内容）。
+   *
+   * ⚠️ **凭据走 git 自己的 credential helper**。插件只是 `spawn('git', ['push'])`：
+   *    学生第一次推的时候由 Git Credential Manager 帮他存好，之后就不用再管。
+   *    插件从头到尾**看不到那个密钥**，也不写任何 token 到磁盘 ——
+   *    这是「插件里不放任何人的密钥」这条口径在"学生也要推东西"之后仍然成立的原因。
+   *
+   * 落点与配置（都在本机，不进任何仓库）：
+   *   · 仓地址：`~/.dsh/cip-question-repo.txt`（一行，与工作区文件同样的做法）
+   *   · 本地克隆：`~/.dsh/q-repo/`
+   */
+  async 'question.repo'(args) {
+    const input = args && typeof args === 'object' ? args : {}
+    if (input.url === undefined) {
+      return { ok: true, url: readQRepoUrl(), dir: Q_REPO_DIR, file: qRepoFile(), exists: fsExists(Q_REPO_DIR) }
+    }
+    const url = oneLine(input.url)
+    // 只收不带凭据的 https 地址：这个地址会写进本机配置文件、也会显示在界面上，
+    // 而学生是从老师那里复制粘贴的 —— 粘进来一个带 token 的地址是最常见的一种事故。
+    if (url && !/^https:\/\//i.test(url)) {
+      return { ok: false, error: '只支持 https 地址（老师给你的那条应该是 https://github.com/… 的形状）。' }
+    }
+    if (/\/\/[^/\s@:]+:[^/\s@]+@/.test(url) || /\/\/[^/\s@:]+@/.test(url)) {
+      return { ok: false, error: '这个地址里带着账号或 token —— 请用老师给的那条**不含凭据**的地址。' }
+    }
+    try {
+      const f = qRepoFile()
+      fs.mkdirSync(path.dirname(f), { recursive: true })
+      fs.writeFileSync(f, [
+        '# 你的「提问仓库」地址 —— 由课程面板写入。',
+        '# 这是**你自己**的私有仓（只有你和老师能看到），提问会推到这里。',
+        '# 换地址就改这一行；也可以用环境变量 CIP_QREPO 覆盖。',
+        url,
+      ].join('\r\n') + '\r\n', 'utf8')
+    } catch (e) {
+      return { ok: false, error: '写不进配置文件（' + oneLine((e && e.message) || e) + '）：' + qRepoFile() }
+    }
+    return { ok: true, url, dir: Q_REPO_DIR, file: qRepoFile() }
+  },
+
+  /**
+   * 把本机提问推到自己的仓。
+   * **永远返回 ok:true**（离线是常态；失败用 level/error 说清），与 update.* 同一个口径。
+   */
+  async 'question.push'() {
+    const git = findGit(() => {
+      const p = runCaptured('git', ['--version'], { timeout: 20000, hintDir: core.WORKSPACE })
+      return !p.error && runExitCode(p) === 0
+    })
+    const out = { ok: true, pushed: false, level: '', text: '', hint: '', files: 0, dir: Q_REPO_DIR, url: readQRepoUrl(), output: '' }
+    if (!git) {
+      out.level = 'no-git'
+      out.text = '这台机器上跑不了 git —— 提问没法交上去。'
+      out.hint = '装上 Git for Windows（装完重启 DSH），再回来点一次。'
+      return out
+    }
+    const url = out.url
+    if (!url) {
+      out.level = 'no-repo'
+      out.text = '还没有填「提问仓库」地址 —— 所以提问只在这台机器上，老师看不到。'
+      out.hint = '把老师发给你的那条仓库地址填进来（老师那边点「批量建仓」会给你一条专属的）。'
+      return out
+    }
+    // 源目录：这个学生自己的提问
+    const srcDir = path.join(core.courseAbs ? core.courseAbs('课程问题池') : path.join(core.WORKSPACE, '课程问题池'), '学生', STUDENT)
+    if (!fsExists(srcDir)) {
+      out.level = 'nothing'
+      out.text = '你还没有提过问 —— 没有要交的东西。'
+      return out
+    }
+    // ① 本地克隆：没有就 clone，有就 pull（只快进）
+    if (!fsExists(path.join(Q_REPO_DIR, '.git'))) {
+      try { fs.mkdirSync(path.dirname(Q_REPO_DIR), { recursive: true }) } catch (e) { /* 已存在 */ }
+      try { fs.rmSync(Q_REPO_DIR, { recursive: true, force: true }) } catch (e) { /* 不存在 */ }
+      const cl = runCaptured(git, ['clone', url, Q_REPO_DIR], { timeout: 300000, hintDir: path.dirname(Q_REPO_DIR) })
+      if (runExitCode(cl) !== 0) return qPushFail(out, 'clone', runOutput(cl), url)
+    } else {
+      const pl = runCaptured(git, ['--no-optional-locks', '-C', Q_REPO_DIR, 'pull', '--ff-only'], { timeout: 180000, hintDir: Q_REPO_DIR })
+      // 拉不动不算失败（本地是空的仓、或者断网）—— 继续往下推，推的时候自然会报
+      out.output = runOutput(pl).slice(-800)
+    }
+    // ② 把提问复制进去（**整个目录覆盖**：以本机为准，这台机器上的就是最新的）
+    let copied = 0
+    try {
+      for (const e of fs.readdirSync(srcDir, { withFileTypes: true })) {
+        if (!e.isFile()) continue
+        fs.copyFileSync(path.join(srcDir, e.name), path.join(Q_REPO_DIR, e.name))
+        copied += 1
+      }
+    } catch (e) {
+      out.level = 'copy-failed'
+      out.text = '读不到你的提问文件：' + oneLine((e && e.message) || e)
+      return out
+    }
+    out.files = copied
+    if (!copied) {
+      out.level = 'nothing'
+      out.text = '你还没有提过问 —— 没有要交的东西。'
+      return out
+    }
+    // ③ add / commit / push
+    const run = (args, timeout) => runCaptured(git, ['--no-optional-locks', '-C', Q_REPO_DIR].concat(args), { timeout: timeout, hintDir: Q_REPO_DIR })
+    run(['add', '-A'], 60000)
+    const stt = run(['status', '--porcelain=v1'], 60000)
+    const changed = parseChangedPaths(stt.stdout).length
+    if (changed) {
+      const msg = '提问：' + new Date().toISOString().slice(0, 16).replace('T', ' ')
+      const cm = run(['-c', 'user.name=' + STUDENT, '-c', 'user.email=' + STUDENT + '@localhost', 'commit', '-q', '-m', msg], 60000)
+      if (runExitCode(cm) !== 0) {
+        out.level = 'commit-failed'
+        out.text = '提交失败：' + (runOutput(cm) || '没有输出').slice(-300)
+        return out
+      }
+    }
+    const ps = run(['push', 'origin', 'HEAD'], 300000)
+    out.output = (out.output ? (out.output + '\n') : '') + runOutput(ps).slice(-1500)
+    if (runExitCode(ps) === 0) {
+      out.pushed = true
+      out.level = 'pushed'
+      out.text = '交上去了：' + copied + ' 份提问已经推到你自己的仓，老师那边拉一下就能看到。'
+      return out
+    }
+    return qPushFail(out, 'push', runOutput(ps), url)
+  },
 
     /**
      * 就绪清单。面板装完第一件事就拉它 ——

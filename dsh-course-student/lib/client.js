@@ -1718,6 +1718,89 @@ window.__ModuleLoader__.load({
 
     // ── 面板 ──
     /**
+     * 「把我的提问交上去」（方案 A 第②步的界面）。
+     *
+     * 老师要的是：**他提的问题能在另一台机器上的教师端看到**。
+     * 这个卡片就是学生这一侧唯一要按的那一下。
+     *
+     * 三条界面规则（每一条都对应一种学生会踩的坑）：
+     *
+     *   ① **没填地址时不要只显示一个禁用的按钮**。学生看到灰按钮只会以为"坏了"，
+     *      而他要做的是「把老师发的那条地址粘进来」—— 所以直接把输入框摆出来。
+     *   ② **推不动时不许弹红条**。离线、还没接受邀请，都是常态；
+     *      而 `question.push` 的设计是永远 ok:true，用 `level` 说清状态。
+     *      弹红条只会让学生下次不敢点。
+     *   ③ **一定要说"提问还在你本机，没有丢"**。这是他们最担心的事，
+     *      不说的话，一次失败他就再也不敢用这个功能了。
+     */
+    function QuestionSubmit({ st, set }) {
+      const info = st.qRepoInfo
+      const [url, setUrl] = React.useState('')
+      const [busy, setBusy] = React.useState(false)
+      const [msg, setMsg] = React.useState('')
+      const [open, setOpen] = React.useState(false)
+
+      const save = async () => {
+        setBusy(true); setMsg('')
+        try {
+          const r = await api('question.repo', { url: url.trim() })
+          if (r && r.ok) { setMsg('地址记下了。现在可以点「交上去」。'); setUrl(''); await reload() }
+          else setMsg((r && r.error) || '地址没记下来（宿主没给原因）')
+        } catch (e) { setMsg('' + ((e && e.message) || e)) } finally { setBusy(false) }
+      }
+      const push = async () => {
+        setBusy(true); setMsg('')
+        try {
+          const r = await api('question.push', {})
+          setMsg(r && r.pushed
+            ? ('✓ ' + (r.text || '交上去了。'))
+            : [r && r.text, r && r.hint].filter(Boolean).join('　'))
+          if (r && r.ok) await reload()
+        } catch (e) { setMsg('没交上去：' + ((e && e.message) || e) + '　（提问还在你本机，没有丢）') } finally { setBusy(false) }
+      }
+      const reload = async () => {
+        try { set({ qRepoInfo: await api('question.repo', {}) }) } catch (e) { set({ qRepoInfo: null }) }
+      }
+      const hasUrl = !!(info && info.url)
+
+      return h('div', { className: 'kce', style: { margin: '8px 14px 0', flexWrap: 'wrap' } },
+        h('span', { className: 'k57' }, '我的提问：'),
+        hasUrl
+          ? h('span', { className: 'k9c', title: info.url }, '已连到自己的提问仓库 ✓')
+          : h('span', { className: 'k57', style: { color: 'var(--dsw-alias-state-warn-primary)' } },
+            '还没连上 —— 老师看不到你的提问'),
+        h('span', { className: 'k54' }),
+        hasUrl
+          ? h('button', { className: 'k42 k11', disabled: busy, onClick: push },
+            busy ? '正在交…' : '把我的提问交上去')
+          : null,
+        h('button', { className: 'k42', disabled: busy, onClick: () => setOpen(!open) },
+          open ? '收起' : (hasUrl ? '换地址' : '填老师给的地址')),
+        // ⚠️ 输入框**默认不渲染**（要点「填老师给的地址」才出来）。
+        //    第一版写的是 `open || !hasUrl`，也就是"没配好就把输入框摊在顶上" ——
+        //    理由是"别只给一个灰按钮让学生以为坏了"。但那样违反了这一页已经在守的
+        //    另一条规则：「收起时只留一条提示、不占地方」（verify-clients 有一条断言
+        //    专门数输入框个数，它当场把这条打红了）。
+        //    两者其实不冲突：**提示 + 一个有明确名字的按钮**同样不会让人以为坏了，
+        //    而按钮上的字（「填老师给的地址」）已经说清了点下去会做什么。
+        open
+          ? h('div', { style: { flex: '1 1 100%' } },
+            h('div', { className: 'k57' }, '老师会发给你一条**只属于你**的仓库地址（形如 https://github.com/…）。'
+              + '填在这里，之后点「交上去」，老师那边就能看到你的提问了。'
+              + '这个仓库只有你和老师能看到。'),
+            h('div', { className: 'kca' },
+              h('input', {
+                className: 'k61', style: { flex: '1 1 320px' }, value: url,
+                placeholder: 'https://github.com/<老师给你的那个仓>.git',
+                onChange: (e) => setUrl(e.target.value),
+                onKeyDown: (e) => { if (e.key === 'Enter' && url.trim()) save() },
+              }),
+              h('button', { className: 'k42 k11', disabled: busy || !url.trim(), onClick: save }, '记下这个地址')))
+          : null,
+        msg ? h('div', { className: 'kd1', style: { flex: '1 1 100%', marginTop: '4px' } }, msg) : null)
+    }
+
+    /**
      * ── 顶栏的课程切换器 ────────────────────────────────────────────────
      *
      * ⚠️ 这个函数在**两端各有一份、必须逐字一致**（`verify-setup-wizard.mjs` ⑨b 有断言守着）。
@@ -2285,6 +2368,50 @@ window.__ModuleLoader__.load({
       // 把作业交到另一门课去，而界面看起来一切正常。
       React.useEffect(() => { loadCourseInfo() }, [loadCourseInfo])
       React.useEffect(() => { loadCourseOptions() }, [loadCourseOptions])
+      // 提问仓的状态（地址填了没有）：面板打开时读一次，读的是本机配置文件。
+      React.useEffect(() => {
+        let alive = true
+        ;(async () => {
+          try {
+            const r = await api('question.repo', {})
+            if (alive) set({ qRepoInfo: r })
+          } catch (e) { if (alive) set({ qRepoInfo: null }) }
+        })()
+        return () => { alive = false }
+      }, [])
+      // ── 自动更新 ────────────────────────────────────────────────────
+      /**
+       * 老师的要求：「自动查找公开仓的更新信息并定时重新更新，
+       * 比如使用期间十分钟一次，重新启用时自动更新」。
+       *
+       * ⚠️ 三条安全约束都由**宿主**保证（见 core 的 updateState / updatePull）：
+       *    只快进、有未提交改动时一步都不动、失败只提示不报红。
+       *    界面这边只负责**什么时候跑**：打开时一次 + 每十分钟一次。
+       *
+       * ⚠️ 更新失败**不弹红条**：`update.*` 的设计是永远 ok:true（离线是常态）。
+       *    一条会随网络变红的提示，只会训练学生无视所有提示。
+       */
+      const runUpdate = React.useCallback(async () => {
+        try {
+          const s = await api('update.status', {})
+          set({ updateInfo: s })
+          if (s && s.canPull) {
+            const r = await api('update.pull', {})
+            set({ updateInfo: r })
+            if (r && r.pulled) {
+              set({ notice: '课程内容已更新（远端有 ' + s.behind + ' 个新提交）。' })
+              await load()
+            }
+          }
+        } catch (err) { /* 不打扰用户：宿主那边已经把它变成一句人话了 */ }
+      }, [load])
+      React.useEffect(() => { runUpdate() }, [runUpdate])
+      React.useEffect(() => {
+        // ⚠️ 卸载时必须 clearInterval —— 不清的话关掉面板之后它还在跑，
+        //    一路往宿主发请求（这个项目在轮询上踩过同一个坑，见 SetupWizard 的 mountedRef）。
+        const t = setInterval(() => { runUpdate() }, 10 * 60 * 1000)
+        return () => clearInterval(t)
+      }, [runUpdate])
       React.useEffect(() => { loadKatex(CFG.katex, { onDone: (ok, err) => set(ok ? { katexReady: true } : { katexError: err || '未知' }) }) }, [])
       // 侧栏收起状态：记住上次的选择。localStorage 在某些嵌入环境下会抛异常
       // （隐私模式 / 三方 cookie 限制），所以包在 try 里 —— 记不住偏好是可以接受的，
@@ -2362,6 +2489,11 @@ window.__ModuleLoader__.load({
         // 而「加载失败：读课程数据失败」那条红条会把它往下挤 ——
         // 用户看到的第一个东西应该正好是「现在该做的那一件事」。
         h(SetupWizard, { info: st.info, api: api, onDone: load }),
+        // 「把我的提问交上去」：学生这一侧唯一要按的那一下（见 QuestionSubmit 的注释）。
+        // ⚠️ 排在向导**之后**：工作区都没配好的时候，提问仓也没意义。
+        // ⚠️ 已配好工作区时才显示（向导在时它会和向导抢注意力）。
+        (st.info && st.info.setup && st.info.setup.workspaceResolved === false)
+          ? null : h(QuestionSubmit, { st, set }),
         // 媒体源**配了但无效**时吭一声：那是「图全都加载不出来」里最难查的一档 ——
         // 地址拼错时取回来的是 404，界面上的表现与「这张图本来就没有」一模一样，
         // 而配置文件看起来完全正确。正常配置下一声不吭，不占地方。
@@ -2502,7 +2634,7 @@ window.__ModuleLoader__.load({
     // SlideTextChip / pickLabel：框内取字与证据条标题（纯逻辑，决定跨页证据到底带上了什么）
     // LessonForm / LessonPage / Markdown：课时页的验收靠单独驱动它们 ——
     //   三个提交页签是条件渲染的，只渲染外层看不到另外两页的文案。
-    exports.__components = { Panel: Panel, ReadinessCard: ReadinessCard, SetupWizard: SetupWizard, SlideTextChip: textInBox, pickLabel: pickLabel, LessonForm: LessonForm, LessonPage: LessonPage, Markdown: Markdown }
+    exports.__components = { Panel: Panel, ReadinessCard: ReadinessCard, SetupWizard: SetupWizard, QuestionSubmit: QuestionSubmit, SlideTextChip: textInBox, pickLabel: pickLabel, LessonForm: LessonForm, LessonPage: LessonPage, Markdown: Markdown }
     return module.exports
   },
 })

@@ -37,6 +37,10 @@ import { cached, statOf, sameStat, clearCache, cacheInfo, cacheDir } from './cac
 import { resolveLayout, layoutReport } from './layout.js'
 // 版本控制信息：这套面板与课程内容是哪个版本发出去的（老师要据此给学生一条克隆命令）
 import { versionInfo, versionSummary } from './version.js'
+// 仓库事实（读 .git/config 与 HEAD）+ 两个解析器。
+// ⚠️ `parseAheadBehind` 必须是**严格锚定**的那一版（见 repo.js 的注释：
+//    宽松正则会从提交日期里抓出"领先 8、落后 19"，而看起来毫无破绽）。
+import { readRepoState, parseAheadBehind, parseChangedPaths } from './repo.js'
 // 首次启动向导的**判断**部分（纯函数）：地址解析、默认落点、目录现状、能不能往下走。
 // 动作部分（起 git、写文件）在本文件 createCore 里的 `setup.*`，因为要用到运行时知识。
 import {
@@ -1838,6 +1842,119 @@ export function createCore(ctx, opts) {
     return Object.assign({ ok: true, switchedTo: abs, workspaceFile: wf }, courseState())
   }
 
+  /**
+   * ── 自动更新（学生端要课程内容；教师端要学生推上来的东西）──────────────
+   *
+   * 老师的要求（原话）：「自动查找 GitHub 上公开仓的更新信息并定时重新更新，
+   * 比如使用期间十分钟一次，重新启用时自动更新」。
+   *
+   * 这一块**只解决"公开仓 → 学生看到"那一段**：它拉的是**本工作区的上游**。
+   * 它**不能**把学生的私有提问送到老师那儿 —— 那些数据从来没进过任何一个
+   * 学生能写、老师能读的地方（见交接文档四之三十八）。
+   * 别把它当成那一件事的答案。
+   *
+   * 三条硬约束，每一条都对应一种真的会毁数据的方式：
+   *
+   *   ① **只 fast-forward**（`git pull --ff-only`）。绝不 rebase、绝不 merge：
+   *      老师的工作区里有教案草稿，学生的工作区里有他的提问，
+   *      自动跑一次 merge 出冲突，用户看到的是一个他完全看不懂的状态。
+   *      快进不了就**如实说"要你手动处理"**，把命令给他。
+   *
+   *   ② **有未提交改动时一步都不动**（`git status --porcelain` 非空就拒）。
+   *      他没提交的东西可能正是他刚写的一段教案 —— 自动 pull 撞上它
+   *      要么失败、要么产生 merge，两种都比"这次不更新"糟得多。
+   *
+   *   ③ **失败只提示，不报红错**。离线是常态（这个项目里 GitHub 时通时不通），
+   *      一条会随网络变红的提示会训练用户无视所有提示。
+   *      所以这一组动作**永远返回 `ok:true`**，用 `level` 字段说清状态。
+   */
+  function updateState() {
+    const ws = WORKSPACE
+    const st = readRepoState(ws)
+    const out = {
+      ok: true, workspace: ws, hasRepo: !!st.hasRepo, remote: st.remoteSafe || st.remoteAny || '',
+      branch: st.branch || '', dirty: false, changed: 0,
+      behind: null, ahead: null, canPull: false,
+      level: 'unknown', text: '', hint: '', pullCmd: '',
+    }
+    if (!st.hasRepo) {
+      out.level = 'no-repo'
+      out.text = '这个工作区还不是 git 仓库 —— 没有上游可以更新。'
+      return out
+    }
+    if (!out.remote) {
+      out.level = 'no-remote'
+      out.text = '工作区没有连远端 —— 更新无从谈起。'
+      return out
+    }
+    const git = gitBin()
+    // 改动：只看**跟踪文件**的改动。忽略项不算 ——
+    // 学生的提问、`我的身份.json` 都在 .gitignore 里，
+    // 不该因为"他有提问"就把自动更新整个关掉（那会让这个功能对最需要它的人失效）。
+    const stt = runCaptured(git, ['--no-optional-locks', '-C', ws, 'status', '--porcelain=v1'],
+      { timeout: 60000, hintDir: ws })
+    if (runExitCode(stt) === 0) {
+      out.changed = parseChangedPaths(stt.stdout).length
+      out.dirty = out.changed > 0
+    }
+    const ref = st.branch ? ('origin/' + st.branch) : 'origin/main'
+    const lg = runCaptured(git, ['--no-optional-locks', '-C', ws, 'rev-list', '--left-right', '--count',
+      (st.branch || 'HEAD') + '...' + ref], { timeout: 60000, hintDir: ws })
+    if (runExitCode(lg) === 0) {
+      const ab = parseAheadBehind(lg.stdout)
+      if (ab) { out.behind = ab.behind; out.ahead = ab.ahead }
+    }
+    out.pullCmd = ['cd "' + ws + '"', 'git pull --ff-only'].join('\n')
+    if (out.behind === null) {
+      out.level = 'unknown'
+      // ⚠️ 措辞不点名 GitHub：远端可能是自建 git（见 sanitizeRemoteUrl）
+      out.text = '读不到「远端有没有新东西」（多半是还没 fetch 过，或者现在连不上远端）。'
+      out.hint = '等网络好一点再打开面板；也可以自己在终端里跑一次 `git fetch`。'
+      return out
+    }
+    if (out.behind === 0) {
+      out.level = 'up-to-date'
+      out.text = '已经是最新的。'
+      return out
+    }
+    if (out.dirty) {
+      out.level = 'blocked'
+      out.text = '远端有 ' + out.behind + ' 个新提交，但你这台机器上有 ' + out.changed
+        + ' 个文件改了还没提交 —— 所以这次**不替你更新**。'
+      out.hint = '先把你自己的改动提交掉（或者先挪到别处），再点「拉取更新」。'
+      return out
+    }
+    out.canPull = true
+    out.level = 'behind'
+    out.text = '远端有 ' + out.behind + ' 个新提交可以拉'
+      + (out.ahead ? ('（本机另有 ' + out.ahead + ' 个没推上去的，那些不受影响）') : '') + '。'
+    return out
+  }
+
+  /**
+   * 真的拉一次。**只有 updateState 说 canPull 时才动手。**
+   * 永远返回 `ok:true`（见上面第 ③ 条：失败只提示）。`pulled:true` 才算真的更新了。
+   */
+  function updatePull() {
+    const before = updateState()
+    if (!before.canPull) return Object.assign({ pulled: false, reason: before.level }, before)
+    const git = gitBin()
+    const r = runCaptured(git, ['--no-optional-locks', '-C', WORKSPACE, 'pull', '--ff-only'],
+      { timeout: 180000, hintDir: WORKSPACE })
+    if (runExitCode(r) === 0) {
+      return Object.assign({ pulled: true, reason: 'ok', output: runOutput(r).slice(-2000) }, updateState())
+    }
+    // 快进不了（本地也有提交，或远端被 force push 过）：**说清楚，把命令给他**
+    return Object.assign({}, updateState(), {
+      pulled: false, reason: 'ff-failed', canPull: false,
+      output: runOutput(r).slice(-2000),
+      level: 'blocked',
+      text: '拉不动：远端和本机都往前走过了，自动更新**不会**替你合并。',
+      hint: '在终端里跑一次 `git pull --rebase`（或 `git pull --no-rebase`），'
+        + '看清冲突再决定怎么处理。命令在下面。',
+    })
+  }
+
   /** 向导的动作集合。各插件在自己的 handlers 里 `...core.coreHandlers` 合并进去。 */
   const coreHandlers = {
     'setup.info': async () => setupState(),
@@ -1870,6 +1987,11 @@ export function createCore(ctx, opts) {
     //    症状是界面上少了几个可切的课，且没有任何地方提示。
     //    这个项目已经在 `info().course` 那个键上栽过一次同样的跟头。
     'course.switch': async (args) => courseSwitch(args && typeof args === 'object' ? args : {}),
+    // 自动更新：`update.status` 纯读盘 + 一次 rev-list；`update.pull` 只在
+    // updateState 说 canPull 时才动工作区（见那两个函数的注释）。
+    // 两端都要有 —— 学生拉课程内容，老师拉学生推上来的东西，是同一件事。
+    'update.status': async () => updateState(),
+    'update.pull': async () => updatePull(),
   }
 
   // ── 资料（课件原件 / 讲义 PDF / 数据集）─────────────────────────────
